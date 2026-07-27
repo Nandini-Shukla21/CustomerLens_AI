@@ -20,6 +20,8 @@ class Settings(BaseModel):
     vector_store_path: str = Field(default=os.getenv("VECTOR_STORE_PATH", "./vector_store"))
     groq_api_key: str = Field(default=os.getenv("GROQ_API_KEY", ""))
     groq_model: str = Field(default=os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"))
+    sqlite_path: str = Field(default=os.getenv("SQLITE_PATH", "./customerlens.db"))
+    jwt_secret: str = Field(default=os.getenv("JWT_SECRET", "change-this-development-secret"))
 
     class Config:
         extra = "ignore"
