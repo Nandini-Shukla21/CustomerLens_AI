@@ -1,45 +1,22 @@
 from __future__ import annotations
 
-from typing import Annotated
+from fastapi import APIRouter
 
-from fastapi import APIRouter, Depends
-
-from app.dependencies import get_analytics_service, get_dashboard_service
-from app.models.response_models import DashboardResponse, DatasetListResponse, DatasetSummaryResponse
-from app.services.analytics_service import AnalyticsService
+from app.services.customer_360_service import Customer360Service
 from app.services.dashboard_service import DashboardService
+from app.config import settings
 
 router = APIRouter()
+customer_360_service = Customer360Service()
 
 
-@router.get("/", response_model=DashboardResponse)
-async def dashboard_summary(
-    service: Annotated[DashboardService, Depends(get_dashboard_service)],
-) -> DashboardResponse:
-    """Return dashboard metrics through the service layer."""
-    return service.get_dashboard_summary()
+@router.get("/")
+async def dashboard_summary() -> dict[str, object]:
+    """Return live metrics calculated from uploaded datasets."""
+    return DashboardService(settings).get_dashboard_overview()
 
 
-@router.get("/overview")
-async def dashboard_overview(
-    service: Annotated[DashboardService, Depends(get_dashboard_service)],
-) -> dict[str, object]:
-    """Return a Recharts-ready overview payload."""
-    return service.get_dashboard_overview()
-
-
-@router.get("/datasets", response_model=list[DatasetListResponse])
-async def list_datasets(
-    service: Annotated[AnalyticsService, Depends(get_analytics_service)],
-) -> list[DatasetListResponse]:
-    """Return metadata for all uploaded datasets."""
-    return [DatasetListResponse(**item) for item in service.list_datasets()]
-
-
-@router.get("/dataset/{dataset_id}/summary", response_model=DatasetSummaryResponse)
-async def dataset_summary(
-    dataset_id: str,
-    service: Annotated[AnalyticsService, Depends(get_analytics_service)],
-) -> DatasetSummaryResponse:
-    """Return analytical details for a specific dataset."""
-    return DatasetSummaryResponse(**service.get_dataset_summary(dataset_id))
+@router.get("/customer/{customer_id}")
+async def customer_profile(customer_id: str) -> dict[str, object]:
+    """Return a dashboard-ready customer 360 payload."""
+    return await customer_360_service.build_customer_profile(customer_id)

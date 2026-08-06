@@ -46,7 +46,7 @@ def initialize_database() -> None:
             conn.execute("ALTER TABLE users ADD COLUMN name TEXT")
             conn.execute("UPDATE users SET name = substr(email, 1, instr(email, '@') - 1) WHERE name IS NULL OR trim(name) = ''")
         for table, column, declaration in (
-            ("documents", "checksum", "TEXT"), ("documents", "indexed_at", "TEXT"),
+            ("documents", "checksum", "TEXT"), ("documents", "indexed_at", "TEXT"), ("documents", "file_type", "TEXT"), ("documents", "size_bytes", "INTEGER DEFAULT 0"),
             ("uploads", "owner_id", "INTEGER"), ("uploads", "file_type", "TEXT"),
             ("uploads", "size_bytes", "INTEGER DEFAULT 0"),
         ):

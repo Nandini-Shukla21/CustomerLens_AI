@@ -18,6 +18,9 @@ class Settings(BaseModel):
     )
     upload_dir: str = Field(default=os.getenv("UPLOAD_DIR", "./uploads"))
     vector_store_path: str = Field(default=os.getenv("VECTOR_STORE_PATH", "./vector_store"))
+    embedding_model: str = Field(
+        default=os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+    )
     groq_api_key: str = Field(default=os.getenv("GROQ_API_KEY", ""))
     groq_model: str = Field(default=os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"))
     sqlite_path: str = Field(default=os.getenv("SQLITE_PATH", "./customerlens.db"))

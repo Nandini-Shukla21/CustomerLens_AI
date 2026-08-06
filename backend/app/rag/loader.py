@@ -11,7 +11,7 @@ from app.core.exceptions import ValidationError
 class DocumentLoader:
     """Load and validate uploaded documents from disk."""
 
-    SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".markdown"}
+    SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".markdown", ".json"}
 
     @staticmethod
     def validate_file(file: UploadFile) -> None:

@@ -33,7 +33,7 @@ class GroqService:
             "Do not dump raw PDF text or include OCR artifacts. "
             "Do not invent facts. "
             "If the retrieved context does not contain enough information to answer the question, say exactly: "
-            '"I couldn\'t find enough information in the uploaded documents to answer this question."' "
+            "I couldn't find enough information in the uploaded documents to answer this question."
             "Keep the answer clear, concise, and natural."
         )
 

@@ -35,4 +35,10 @@ class DocumentParser:
         if suffix in {".txt", ".md", ".markdown"}:
             return file_path.read_text(encoding="utf-8")
 
+        if suffix == ".json":
+            import json
+
+            with file_path.open("r", encoding="utf-8") as handle:
+                return json.dumps(json.load(handle), indent=2, ensure_ascii=False)
+
         raise ValidationError(f"Unsupported file type: {suffix}")
