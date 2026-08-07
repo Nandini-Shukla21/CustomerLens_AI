@@ -1768,15 +1768,53 @@ def delete_dataset(
 # ============================================================
 
 @router.get("/dashboard")
-def dashboard(
-    user: dict = Depends(current_user),
-):
+def dashboard(user: dict = Depends(current_user)):
+    """
+    Return dashboard data for the most recently uploaded dataset.
 
+    This endpoint is kept for backward compatibility.
+    The frontend should preferably use:
+        GET /dashboard/datasets
+        GET /dashboard/datasets/{dataset_id}
+    """
     with connection() as conn:
+        row = conn.execute(
+            """
+            SELECT id
+            FROM datasets
+            WHERE owner_id=?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (user["sub"],),
+        ).fetchone()
 
+    if not row:
+        return {
+            "dataset": None,
+            "kpis": metrics(pd.DataFrame()),
+            "charts": [],
+        }
+
+    return dashboard_dataset(row["id"], user)
+
+@router.get("/dashboard/datasets")
+def dashboard_datasets(user: dict = Depends(current_user)):
+    """
+    Return all datasets available to the current user.
+
+    The frontend uses this list to display selectable dataset cards/tabs
+    on the dashboard.
+    """
+    with connection() as conn:
         rows = conn.execute(
             """
-            SELECT *
+            SELECT
+                id,
+                filename,
+                rows,
+                columns,
+                created_at
             FROM datasets
             WHERE owner_id=?
             ORDER BY created_at DESC
@@ -1784,155 +1822,510 @@ def dashboard(
             (user["sub"],),
         ).fetchall()
 
-        uploads = [
-            dict(r)
-            for r in conn.execute(
-                """
-                SELECT filename,status,created_at
-                FROM uploads
-                ORDER BY created_at DESC
-                LIMIT 5
-                """
-            ).fetchall()
-        ]
+    return [
+        {
+            "id": row["id"],
+            "filename": row["filename"],
+            "rows": int(row["rows"]),
+            "columns": int(row["columns"]),
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]
 
-    frames = []
+@router.get("/dashboard/datasets/{dataset_id}")
+def dashboard_dataset(
+    dataset_id: str,
+    user: dict = Depends(current_user),
+):
+    """
+    Generate a dashboard dynamically from ONE selected dataset.
 
-    for row in rows:
+    The function detects:
+    - numeric columns
+    - categorical columns
+    - date columns
 
-        try:
-            frames.append(
-                pd.read_csv(row["path"])
+    and automatically creates suitable chart data.
+    """
+
+    row, frame = load_dataset(dataset_id, user["sub"])
+
+    if frame.empty:
+        return {
+            "dataset": {
+                "id": dataset_id,
+                "filename": row["filename"],
+                "rows": 0,
+                "columns": 0,
+            },
+            "kpis": {},
+            "charts": [],
+        }
+
+    # ---------------------------------------------------------
+    # BASIC INFORMATION
+    # ---------------------------------------------------------
+
+    columns = [str(column) for column in frame.columns]
+
+    numeric_columns = [
+        str(column)
+        for column in frame.select_dtypes(include="number").columns
+    ]
+
+    categorical_columns = [
+        str(column)
+        for column in frame.select_dtypes(
+            include=["object", "category", "bool"]
+        ).columns
+    ]
+
+    # ---------------------------------------------------------
+    # DETECT DATE COLUMNS
+    # ---------------------------------------------------------
+
+    date_columns = []
+
+    for column in frame.columns:
+        column_name = str(column).lower()
+
+        if any(
+            keyword in column_name
+            for keyword in [
+                "date",
+                "time",
+                "timestamp",
+                "created",
+                "updated",
+            ]
+        ):
+            converted = pd.to_datetime(
+                frame[column],
+                errors="coerce",
             )
 
-        except Exception:
-            continue
+            if converted.notna().sum() > 0:
+                date_columns.append(str(column))
 
-    frame = (
-        pd.concat(
-            frames,
-            ignore_index=True,
+    # ---------------------------------------------------------
+    # KPI DATA
+    # ---------------------------------------------------------
+
+    kpis = {
+        "total_records": int(len(frame)),
+        "total_columns": int(len(frame.columns)),
+        "numeric_columns": int(len(numeric_columns)),
+        "categorical_columns": int(len(categorical_columns)),
+        "missing_values": int(frame.isna().sum().sum()),
+        "duplicate_rows": int(frame.duplicated().sum()),
+    }
+
+    # ---------------------------------------------------------
+    # CHARTS
+    # ---------------------------------------------------------
+
+    charts = []
+
+    # =========================================================
+    # CHART 1
+    # CATEGORICAL DISTRIBUTION
+    # =========================================================
+
+    if categorical_columns:
+
+        selected_column = None
+
+        # Prefer meaningful categorical columns.
+        preferred_keywords = [
+            "department",
+            "dept",
+            "category",
+            "segment",
+            "gender",
+            "status",
+            "type",
+            "region",
+            "state",
+            "city",
+            "joblevel",
+        ]
+
+        for keyword in preferred_keywords:
+            selected_column = next(
+                (
+                    column
+                    for column in categorical_columns
+                    if keyword in column.lower()
+                ),
+                None,
+            )
+
+            if selected_column:
+                break
+
+        if selected_column is None:
+            selected_column = categorical_columns[0]
+
+        counts = (
+            frame[selected_column]
+            .fillna("Unknown")
+            .astype(str)
+            .value_counts()
+            .head(10)
         )
-        if frames
-        else pd.DataFrame()
-    )
 
-    result = (
-        metrics(frame)
-        if not frame.empty
-        else metrics(pd.DataFrame())
-    )
-
-    segment = norm(
-        list(frame.columns),
-        ["segment", "customer_segment"],
-    )
-
-    risk = norm(
-        list(frame.columns),
-        ["risk", "risk_score"],
-    )
-
-    date = norm(
-        list(frame.columns),
-        [
-            "date",
-            "transaction_date",
-            "created_at",
-        ],
-    )
-
-    revenue = norm(
-        list(frame.columns),
-        ["revenue", "amount", "sales"],
-    )
-
-    result.update(
-        {
-            "datasets": len(rows),
-            "documents": 0,
-            "recent_uploads": uploads,
-
-            "segment_distribution": (
-                [
+        charts.append(
+            {
+                "id": "categorical_distribution",
+                "type": "bar",
+                "title": f"{selected_column} Distribution",
+                "description": f"Distribution of records by {selected_column}.",
+                "xKey": "category",
+                "series": [
                     {
-                        "name": str(k),
-                        "value": int(v),
+                        "dataKey": "count",
+                        "label": "Records",
                     }
-                    for k, v in
-                    frame[segment]
-                    .fillna("Unknown")
+                ],
+                "data": [
+                    {
+                        "category": str(category),
+                        "count": int(count),
+                    }
+                    for category, count in counts.items()
+                ],
+            }
+        )
+
+    # =========================================================
+    # CHART 2
+    # NUMERIC DISTRIBUTION
+    # =========================================================
+
+    if numeric_columns:
+
+        selected_numeric = None
+
+        preferred_numeric_keywords = [
+            "revenue",
+            "sales",
+            "amount",
+            "income",
+            "salary",
+            "age",
+            "experience",
+            "score",
+            "rating",
+            "satisfaction",
+        ]
+
+        for keyword in preferred_numeric_keywords:
+            selected_numeric = next(
+                (
+                    column
+                    for column in numeric_columns
+                    if keyword in column.lower()
+                ),
+                None,
+            )
+
+            if selected_numeric:
+                break
+
+        if selected_numeric is None:
+            selected_numeric = numeric_columns[0]
+
+        numeric_series = pd.to_numeric(
+            frame[selected_numeric],
+            errors="coerce",
+        ).dropna()
+
+        if not numeric_series.empty:
+
+            # Create sensible histogram buckets.
+            unique_count = numeric_series.nunique()
+
+            if unique_count <= 10:
+
+                distribution = (
+                    numeric_series
                     .value_counts()
-                    .items()
-                ]
-                if segment
-                else []
-            ),
+                    .sort_index()
+                )
 
-            "risk_distribution": (
-                [
+                chart_data = [
                     {
-                        "name": str(k),
-                        "value": int(v),
+                        "category": str(value),
+                        "count": int(count),
                     }
-                    for k, v in
-                    pd.cut(
-                        pd.to_numeric(
-                            frame[risk],
-                            errors="coerce",
-                        ).fillna(0),
-                        [-1, 0.3, 0.6, 1],
-                        labels=[
-                            "Low",
-                            "Medium",
-                            "High",
-                        ],
+                    for value, count in distribution.items()
+                ]
+
+            else:
+
+                minimum = float(numeric_series.min())
+                maximum = float(numeric_series.max())
+
+                if minimum == maximum:
+                    chart_data = [
+                        {
+                            "category": str(round(minimum, 2)),
+                            "count": int(len(numeric_series)),
+                        }
+                    ]
+
+                else:
+
+                    bins = 8
+
+                    bucketed = pd.cut(
+                        numeric_series,
+                        bins=bins,
+                        include_lowest=True,
                     )
-                    .value_counts()
-                    .items()
-                ]
-                if risk
-                else []
-            ),
 
-            "revenue_trend": [],
+                    distribution = bucketed.value_counts().sort_index()
 
-            "ai_insights": live_insights(
-                frame
-            ),
-        }
-    )
+                    chart_data = [
+                        {
+                            "category": str(interval),
+                            "count": int(count),
+                        }
+                        for interval, count in distribution.items()
+                    ]
 
-    if date and revenue:
+            charts.append(
+                {
+                    "id": "numeric_distribution",
+                    "type": "bar",
+                    "title": f"{selected_numeric} Distribution",
+                    "description": f"Distribution of {selected_numeric}.",
+                    "xKey": "category",
+                    "series": [
+                        {
+                            "dataKey": "count",
+                            "label": "Records",
+                        }
+                    ],
+                    "data": chart_data,
+                }
+            )
 
-        tmp = pd.DataFrame(
+    # =========================================================
+    # CHART 3
+    # CATEGORY VS NUMERIC
+    # =========================================================
+
+    if categorical_columns and numeric_columns:
+
+        category_column = None
+
+        preferred_category_keywords = [
+            "department",
+            "dept",
+            "segment",
+            "category",
+            "region",
+            "state",
+            "city",
+            "type",
+            "status",
+        ]
+
+        for keyword in preferred_category_keywords:
+            category_column = next(
+                (
+                    column
+                    for column in categorical_columns
+                    if keyword in column.lower()
+                ),
+                None,
+            )
+
+            if category_column:
+                break
+
+        if category_column is None:
+            category_column = categorical_columns[0]
+
+        numeric_column = None
+
+        preferred_numeric_keywords = [
+            "revenue",
+            "sales",
+            "amount",
+            "salary",
+            "experience",
+            "age",
+            "score",
+            "rating",
+            "satisfaction",
+        ]
+
+        for keyword in preferred_numeric_keywords:
+            numeric_column = next(
+                (
+                    column
+                    for column in numeric_columns
+                    if keyword in column.lower()
+                ),
+                None,
+            )
+
+            if numeric_column:
+                break
+
+        if numeric_column is None:
+            numeric_column = numeric_columns[0]
+
+        temp = frame[
+            [category_column, numeric_column]
+        ].copy()
+
+        temp[numeric_column] = pd.to_numeric(
+            temp[numeric_column],
+            errors="coerce",
+        )
+
+        temp = temp.dropna(subset=[numeric_column])
+
+        if not temp.empty:
+
+            grouped = (
+                temp.groupby(
+                    temp[category_column].fillna("Unknown").astype(str)
+                )[numeric_column]
+                .mean()
+                .sort_values(ascending=False)
+                .head(10)
+            )
+
+            charts.append(
+                {
+                    "id": "category_numeric_comparison",
+                    "type": "bar",
+                    "title": f"Average {numeric_column} by {category_column}",
+                    "description": (
+                        f"Average {numeric_column} across "
+                        f"{category_column}."
+                    ),
+                    "xKey": "category",
+                    "series": [
+                        {
+                            "dataKey": "value",
+                            "label": f"Average {numeric_column}",
+                        }
+                    ],
+                    "data": [
+                        {
+                            "category": str(category),
+                            "value": round(float(value), 2),
+                        }
+                        for category, value in grouped.items()
+                    ],
+                }
+            )
+
+    # =========================================================
+    # CHART 4
+    # DATE TREND
+    # =========================================================
+
+    if date_columns and numeric_columns:
+
+        date_column = date_columns[0]
+
+        numeric_column = None
+
+        preferred_numeric_keywords = [
+            "revenue",
+            "sales",
+            "amount",
+            "income",
+            "profit",
+            "value",
+        ]
+
+        for keyword in preferred_numeric_keywords:
+            numeric_column = next(
+                (
+                    column
+                    for column in numeric_columns
+                    if keyword in column.lower()
+                ),
+                None,
+            )
+
+            if numeric_column:
+                break
+
+        if numeric_column is None:
+            numeric_column = numeric_columns[0]
+
+        temp = pd.DataFrame(
             {
                 "date": pd.to_datetime(
-                    frame[date],
+                    frame[date_column],
                     errors="coerce",
                 ),
-
-                "revenue": pd.to_numeric(
-                    frame[revenue],
+                "value": pd.to_numeric(
+                    frame[numeric_column],
                     errors="coerce",
-                ).fillna(0),
+                ),
             }
         ).dropna()
 
-        result["revenue_trend"] = [
-            {
-                "period": str(k),
-                "revenue": float(v),
-            }
-            for k, v in
-            tmp.groupby(
-                tmp.date.dt.to_period("M")
-            )["revenue"]
-            .sum()
-            .items()
-        ]
+        if not temp.empty:
 
-    return result
+            temp["period"] = temp["date"].dt.to_period("M")
+
+            trend = (
+                temp.groupby("period")["value"]
+                .sum()
+                .sort_index()
+            )
+
+            charts.append(
+                {
+                    "id": "time_series",
+                    "type": "line",
+                    "title": f"{numeric_column} Trend",
+                    "description": (
+                        f"{numeric_column} over time."
+                    ),
+                    "xKey": "period",
+                    "series": [
+                        {
+                            "dataKey": "value",
+                            "label": numeric_column,
+                        }
+                    ],
+                    "data": [
+                        {
+                            "period": str(period),
+                            "value": round(float(value), 2),
+                        }
+                        for period, value in trend.items()
+                    ],
+                }
+            )
+
+    # ---------------------------------------------------------
+    # RETURN
+    # ---------------------------------------------------------
+
+    return {
+        "dataset": {
+            "id": dataset_id,
+            "filename": row["filename"],
+            "rows": int(row["rows"]),
+            "columns": int(row["columns"]),
+            "column_names": columns,
+        },
+        "kpis": kpis,
+        "charts": charts[:4],
+    }
 
 
 # ============================================================
@@ -2050,120 +2443,69 @@ def customer(
 # ============================================================
 
 @router.get("/analytics")
-def analytics(
-    dataset_id: str | None = None,
-    user: dict = Depends(current_user),
-):
-
+def analytics(dataset_id: str | None = None, user: dict = Depends(current_user)):
     if dataset_id:
-
-        _, frame = load_dataset(
-            dataset_id,
-            user["sub"],
-        )
-
+        _, frame = load_dataset(dataset_id, user["sub"])
     else:
-
         with connection() as conn:
-
             row = conn.execute(
-                """
-                SELECT id
-                FROM datasets
-                WHERE owner_id=?
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-                (user["sub"],),
+                "SELECT id FROM datasets WHERE owner_id=? ORDER BY created_at DESC LIMIT 1",
+                (user["sub"],)
             ).fetchone()
 
-        frame = (
-            load_dataset(
-                row["id"],
-                user["sub"],
-            )[1]
-            if row
-            else pd.DataFrame()
-        )
+        frame = load_dataset(row["id"], user["sub"])[1] if row else pd.DataFrame()
 
     segment = norm(
         list(frame.columns),
-        ["segment", "customer_segment"],
+        ["segment", "customer_segment"]
     )
 
     revenue = norm(
         list(frame.columns),
-        [
-            "revenue",
-            "amount",
-            "sales",
-            "total_amount",
-            "spend",
-        ],
+        ["revenue", "amount", "sales", "total_amount", "spend"]
     )
 
     date = norm(
         list(frame.columns),
-        [
-            "date",
-            "transaction_date",
-            "created_at",
-        ],
+        ["date", "transaction_date", "created_at"]
     )
 
     trends = []
 
     if date and revenue:
-
-        tmp = pd.DataFrame(
-            {
-                "date": pd.to_datetime(
-                    frame[date],
-                    errors="coerce",
-                ),
-
-                "revenue": pd.to_numeric(
-                    frame[revenue],
-                    errors="coerce",
-                ).fillna(0),
-            }
-        ).dropna()
+        tmp = pd.DataFrame({
+            "date": pd.to_datetime(frame[date], errors="coerce"),
+            "revenue": pd.to_numeric(
+                frame[revenue],
+                errors="coerce"
+            ).fillna(0)
+        }).dropna()
 
         trends = [
             {
                 "period": str(k),
-                "revenue": float(v),
+                "revenue": float(v)
             }
-            for k, v in
-            tmp.groupby(
+            for k, v in tmp.groupby(
                 tmp.date.dt.to_period("M")
-            )["revenue"]
-            .sum()
-            .items()
+            )["revenue"].sum().items()
         ]
 
     return {
         "kpis": metrics(frame),
-        "columns": list(
-            map(str, frame.columns)
-        ),
+        "columns": list(map(str, frame.columns)),
         "records": len(frame),
         "revenue_trend": trends,
-        "segments": (
-            [
-                {
-                    "name": str(k),
-                    "value": int(v),
-                }
-                for k, v in
-                frame[segment]
+        "segments": [
+            {
+                "name": str(k),
+                "value": int(v)
+            }
+            for k, v in frame[segment]
                 .fillna("Unknown")
                 .value_counts()
                 .items()
-            ]
-            if segment
-            else []
-        ),
+        ] if segment else []
     }
 
 
