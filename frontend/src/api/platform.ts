@@ -27,13 +27,20 @@ export type UploadResult = {
   dataset_id?: string;
   document_id?: string;
   filename: string;
+
   row_count?: number;
   column_count?: number;
+
   columns?: string[];
+
   data_types?: Record<string, string>;
+
   missing_values?: Record<string, number>;
+
   quality_score?: number;
+
   chunks?: number;
+
   status?: string;
 };
 
@@ -68,26 +75,33 @@ export const platformApi = {
     limit = 200,
   ) =>
     api
-      .get(`/datasets/${encodeURIComponent(id)}/preview`, {
-        params: {
-          offset,
-          q,
-          limit,
+      .get(
+        `/datasets/${encodeURIComponent(id)}/preview`,
+        {
+          params: {
+            offset,
+            q,
+            limit,
+          },
         },
-      })
+      )
       .then((r) => r.data),
 
   datasetColumns: (id: string) =>
     api
-      .get(`/datasets/${encodeURIComponent(id)}/columns`)
+      .get(
+        `/datasets/${encodeURIComponent(id)}/columns`,
+      )
       .then((r) => r.data),
 
   // ==========================================================
   // DATASET DOWNLOAD
   // ==========================================================
 
-  downloadDataset: async (id: string): Promise<Blob> => {
-    const response = await api.get(
+  downloadDataset: async (
+    id: string,
+  ): Promise<Blob> => {
+    const response = await api.get<Blob>(
       `/datasets/${encodeURIComponent(id)}/download`,
       {
         responseType: "blob",
@@ -101,29 +115,40 @@ export const platformApi = {
   // DATASET DELETE
   // ==========================================================
 
-  deleteDataset: (id: string) =>
-    api
-      .delete(`/datasets/${encodeURIComponent(id)}`)
-      .then((r) => r.data),
+  deleteDataset: async (
+    id: string,
+  ) => {
+    const response = await api.delete(
+      `/datasets/${encodeURIComponent(id)}`,
+    );
+
+    return response.data;
+  },
 
   // ==========================================================
   // DOCUMENTS
   // ==========================================================
 
   documents: () =>
-    api.get<DocumentItem[]>("/documents").then((r) => r.data),
+    api
+      .get<DocumentItem[]>("/documents")
+      .then((r) => r.data),
 
   document: (id: string) =>
     api
-      .get(`/documents/${encodeURIComponent(id)}`)
+      .get(
+        `/documents/${encodeURIComponent(id)}`,
+      )
       .then((r) => r.data),
 
   // ==========================================================
   // DOCUMENT DOWNLOAD
   // ==========================================================
 
-  downloadDocument: async (id: string): Promise<Blob> => {
-    const response = await api.get(
+  downloadDocument: async (
+    id: string,
+  ): Promise<Blob> => {
+    const response = await api.get<Blob>(
       `/documents/${encodeURIComponent(id)}/download`,
       {
         responseType: "blob",
@@ -137,10 +162,15 @@ export const platformApi = {
   // DOCUMENT DELETE
   // ==========================================================
 
-  deleteDocument: (id: string) =>
-    api
-      .delete(`/documents/${encodeURIComponent(id)}`)
-      .then((r) => r.data),
+  deleteDocument: async (
+    id: string,
+  ) => {
+    const response = await api.delete(
+      `/documents/${encodeURIComponent(id)}`,
+    );
+
+    return response.data;
+  },
 
   // ==========================================================
   // CUSTOMERS
@@ -149,13 +179,17 @@ export const platformApi = {
   customers: (q = "") =>
     api
       .get("/customers", {
-        params: { q },
+        params: {
+          q,
+        },
       })
       .then((r) => r.data),
 
   customer: (id: string) =>
     api
-      .get(`/customers/${encodeURIComponent(id)}`)
+      .get(
+        `/customers/${encodeURIComponent(id)}`,
+      )
       .then((r) => r.data),
 
   // ==========================================================
@@ -165,7 +199,9 @@ export const platformApi = {
   analytics: (dataset_id?: string) =>
     api
       .get("/analytics", {
-        params: dataset_id ? { dataset_id } : {},
+        params: dataset_id
+          ? { dataset_id }
+          : {},
       })
       .then((r) => r.data),
 
@@ -174,7 +210,9 @@ export const platformApi = {
   // ==========================================================
 
   predictionHistory: () =>
-    api.get("/predictions/history").then((r) => r.data),
+    api
+      .get("/predictions/history")
+      .then((r) => r.data),
 
   predict: (
     customer_id: string,
@@ -194,7 +232,9 @@ export const platformApi = {
   search: (q: string) =>
     api
       .get("/search", {
-        params: { q },
+        params: {
+          q,
+        },
       })
       .then((r) => r.data),
 
@@ -203,7 +243,9 @@ export const platformApi = {
   // ==========================================================
 
   reportsDashboard: () =>
-    api.get("/reports/dashboard").then((r) => r.data),
+    api
+      .get("/reports/dashboard")
+      .then((r) => r.data),
 
   // ==========================================================
   // RAG / COPILOT
@@ -228,9 +270,14 @@ export const platformApi = {
   // ==========================================================
 
   me: () =>
-    api.get("/auth/me").then((r) => r.data),
+    api
+      .get("/auth/me")
+      .then((r) => r.data),
 
-  login: (email: string, password: string) =>
+  login: (
+    email: string,
+    password: string,
+  ) =>
     api
       .post("/auth/login", {
         email,
@@ -258,21 +305,27 @@ export const platformApi = {
   // ==========================================================
 
   insights: () =>
-    api.get("/insights").then((r) => r.data),
+    api
+      .get("/insights")
+      .then((r) => r.data),
 
   // ==========================================================
   // NOTIFICATIONS
   // ==========================================================
 
   notifications: () =>
-    api.get("/notifications").then((r) => r.data),
+    api
+      .get("/notifications")
+      .then((r) => r.data),
 
   // ==========================================================
   // ACTIVITY
   // ==========================================================
 
   activity: () =>
-    api.get("/activity").then((r) => r.data),
+    api
+      .get("/activity")
+      .then((r) => r.data),
 
   // ==========================================================
   // UPLOAD
@@ -280,9 +333,12 @@ export const platformApi = {
 
   upload: (
     file: File,
-    onUploadProgress?: (pct: number) => void,
+    onUploadProgress?: (
+      pct: number,
+    ) => void,
   ) => {
     const form = new FormData();
+
     form.append("file", file);
 
     const extension = file.name
@@ -290,25 +346,42 @@ export const platformApi = {
       .pop()
       ?.toLowerCase();
 
-    const endpoint = [
+    const datasetExtensions = [
       "csv",
       "xlsx",
       "xls",
       "json",
-    ].includes(extension ?? "")
-      ? "/datasets"
-      : "/documents";
+    ];
+
+    const endpoint =
+      datasetExtensions.includes(
+        extension ?? "",
+      )
+        ? "/datasets"
+        : "/documents";
 
     return api
-      .post<UploadResult>(endpoint, form, {
-        onUploadProgress: (e) => {
-          onUploadProgress?.(
-            e.total
-              ? Math.round((e.loaded * 100) / e.total)
-              : 0,
-          );
+      .post<UploadResult>(
+        endpoint,
+        form,
+        {
+          onUploadProgress: (event) => {
+            if (event.total) {
+              const percentage =
+                Math.round(
+                  (event.loaded * 100) /
+                    event.total,
+                );
+
+              onUploadProgress?.(
+                percentage,
+              );
+            } else {
+              onUploadProgress?.(0);
+            }
+          },
         },
-      })
+      )
       .then((r) => r.data);
   },
 };
