@@ -1,6 +1,6 @@
+import React, { useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { useState } from "react";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -14,9 +14,16 @@ type Message = { role: "user" | "assistant"; content: string; sources?: string[]
 function CopilotPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
-  const chat = useMutation({ mutationFn: platformApi.copilot });
+  const [selectedDatasetId, setSelectedDatasetId] = useState("");
+  const chat = useMutation({ mutationFn: (question: string) => platformApi.copilot(question, selectedDatasetId || undefined) });
   const datasets = useQuery({ queryKey: ["datasets"], queryFn: platformApi.datasets });
   const documents = useQuery({ queryKey: ["documents"], queryFn: platformApi.documents });
+
+  React.useEffect(() => {
+    if (datasets.data?.length && !selectedDatasetId) {
+      setSelectedDatasetId(datasets.data[0].id);
+    }
+  }, [datasets.data, selectedDatasetId]);
 
   const send = async () => {
     const question = input.trim();
@@ -35,9 +42,28 @@ function CopilotPage() {
     <div className="space-y-6">
       <PageHeader eyebrow="AI Copilot" title="Ask your uploaded data" description="Copilot answers from datasets and knowledge documents with retrieved context and confidence scores." />
       <Card className="p-5">
-        <h3 className="font-semibold">Available sources</h3>
-        <p className="mt-2 text-sm text-muted-foreground">Datasets: {(datasets.data ?? []).map((d) => d.filename).join(", ") || "None"}</p>
-        <p className="mt-1 text-sm text-muted-foreground">Documents: {(documents.data ?? []).map((d) => d.filename).join(", ") || "None"}</p>
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h3 className="font-semibold">Available sources</h3>
+            <p className="mt-2 text-sm text-muted-foreground">Datasets: {(datasets.data ?? []).map((d) => d.filename).join(", ") || "None"}</p>
+            <p className="mt-1 text-sm text-muted-foreground">Documents: {(documents.data ?? []).map((d) => d.filename).join(", ") || "None"}</p>
+          </div>
+          <div className="max-w-xs">
+            <label className="block text-xs font-semibold text-muted-foreground">Dataset</label>
+            <select
+              className="mt-2 w-full rounded border p-2"
+              value={selectedDatasetId}
+              onChange={(e) => setSelectedDatasetId(e.target.value)}
+            >
+              <option value="">Use most recent dataset</option>
+              {(datasets.data ?? []).map((dataset) => (
+                <option key={dataset.id} value={dataset.id}>
+                  {dataset.filename}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
       </Card>
       <Card className="p-6">
         <div className="space-y-4">

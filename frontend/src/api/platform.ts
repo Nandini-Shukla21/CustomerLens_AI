@@ -242,26 +242,30 @@ export const platformApi = {
   // REPORTS
   // ==========================================================
 
-  reportsDashboard: () =>
+  reportsDashboard: (dataset_id?: string) =>
     api
-      .get("/reports/dashboard")
+      .get("/reports/dashboard", {
+        params: dataset_id ? { dataset_id } : {},
+      })
       .then((r) => r.data),
 
   // ==========================================================
   // RAG / COPILOT
   // ==========================================================
 
-  copilot: (question: string) =>
+  copilot: (question: string, dataset_id?: string) =>
     api
       .post("/rag/query", {
         question,
+        dataset_id,
       })
       .then((r) => r.data),
 
-  chat: (question: string) =>
+  chat: (question: string, dataset_id?: string) =>
     api
       .post("/rag/query", {
         question,
+        dataset_id,
       })
       .then((r) => r.data),
 
@@ -304,9 +308,11 @@ export const platformApi = {
   // INSIGHTS
   // ==========================================================
 
-  insights: () =>
+  insights: (dataset_id?: string) =>
     api
-      .get("/insights")
+      .get("/insights", {
+        params: dataset_id ? { dataset_id } : {},
+      })
       .then((r) => r.data),
 
   // ==========================================================
