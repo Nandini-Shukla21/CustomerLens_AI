@@ -12,10 +12,9 @@ from typing import Any
 from io import BytesIO
 
 import pandas as pd
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
-from fastapi.responses import StreamingResponse
-from loguru import logger
 
+from fastapi.responses import FileResponse, StreamingResponse
+from loguru import logger
 from app.config import settings
 from app.core.security import current_user
 from app.core.storage import connection, decode_json, row_dict
@@ -24,7 +23,14 @@ from app.rag.chunker import DocumentChunker
 from app.services.embedding_service import EmbeddingService
 from app.services.groq_service import GroqService
 
-
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    UploadFile,
+)
 router = APIRouter()
 
 
@@ -133,6 +139,41 @@ def norm(columns: list[str], names: list[str]) -> str | None:
     )
 
 
+def _resolve_upload_path(
+    stored_path: str | Path | None,
+    category: str,
+    file_id: str,
+    suffix: str = ".csv",
+) -> Path | None:
+    """Resolve an uploaded file from its stored or expected path."""
+
+    candidates: list[Path] = []
+
+    if stored_path:
+        candidates.append(Path(stored_path))
+
+    upload_root = Path(settings.upload_dir)
+    candidates.append(
+        upload_root / category / f"{file_id}{suffix}"
+    )
+
+    project_root = Path(__file__).resolve().parents[2]
+    candidates.append(
+        project_root / upload_root / category / f"{file_id}{suffix}"
+    )
+
+    for candidate in candidates:
+        try:
+            resolved = candidate.expanduser().resolve()
+        except OSError:
+            resolved = candidate.expanduser()
+
+        if resolved.is_file():
+            return resolved
+
+    return None
+
+
 def load_dataset(
     dataset_id: str,
     owner_id: str | None = None,
@@ -158,15 +199,26 @@ def load_dataset(
     if not row:
         raise HTTPException(404, "Dataset not found")
 
-    try:
-        return row, pd.read_csv(row["path"])
+    file_path = _resolve_upload_path(
+        row.get("path"),
+        "datasets",
+        dataset_id,
+        ".csv",
+    )
 
+    if file_path is None:
+        raise HTTPException(
+            404,
+            "Dataset file no longer exists on the server",
+        )
+
+    try:
+        return row, pd.read_csv(file_path)
     except Exception as exc:
         raise HTTPException(
             500,
             "Dataset file cannot be read",
         ) from exc
-
 
 # ============================================================
 # DATASET METRICS
@@ -1579,22 +1631,43 @@ async def upload_dataset(
 def datasets(
     user: dict = Depends(current_user),
 ):
+    """Return datasets whose CSV files still exist."""
 
     with connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, filename, path, rows, columns, created_at
+            FROM datasets
+            WHERE owner_id=?
+            ORDER BY created_at DESC
+            """,
+            (user["sub"],),
+        ).fetchall()
 
-        return [
-            dict(r)
-            for r in conn.execute(
-                """
-                SELECT id,filename,rows,columns,created_at
-                FROM datasets
-                WHERE owner_id=?
-                ORDER BY created_at DESC
-                """,
-                (user["sub"],),
-            ).fetchall()
-        ]
+    result = []
 
+    for row in rows:
+        file_path = _resolve_upload_path(
+            row["path"],
+            "datasets",
+            row["id"],
+            ".csv",
+        )
+
+        if file_path is None:
+            continue
+
+        result.append(
+            {
+                "id": row["id"],
+                "filename": row["filename"],
+                "rows": row["rows"],
+                "columns": row["columns"],
+                "created_at": row["created_at"],
+            }
+        )
+
+    return result
 
 @router.get("/uploads")
 def upload_history(
@@ -1749,19 +1822,36 @@ def delete_dataset(
         user["sub"],
     )
 
+    file_path = _resolve_upload_path(
+        row.get("path"),
+        "datasets",
+        dataset_id,
+        ".csv",
+    )
+
     with connection() as conn:
+        conn.execute(
+            "DELETE FROM uploads WHERE dataset_id=? AND owner_id=?",
+            (dataset_id, user["sub"]),
+        )
 
         conn.execute(
-            "DELETE FROM datasets WHERE id=?",
+            "DELETE FROM customers WHERE dataset_id=?",
             (dataset_id,),
         )
 
-    Path(
-        row["path"]
-    ).unlink(
-        missing_ok=True
-    )
+        conn.execute(
+            "DELETE FROM predictions WHERE dataset_id=?",
+            (dataset_id,),
+        )
 
+        conn.execute(
+            "DELETE FROM datasets WHERE id=? AND owner_id=?",
+            (dataset_id, user["sub"]),
+        )
+
+    if file_path is not None:
+        file_path.unlink(missing_ok=True)
 
 # ============================================================
 # DASHBOARD
@@ -2936,7 +3026,6 @@ def prediction_history(
         for r in rows
     ]
 
-
 # ============================================================
 # DOCUMENT UPLOAD / RAG INDEXING
 # ============================================================
@@ -2949,7 +3038,6 @@ async def upload_document(
     file: UploadFile = File(...),
     user: dict = Depends(current_user),
 ):
-
     if (
         not file.filename
         or Path(file.filename).suffix.lower()
@@ -2962,33 +3050,31 @@ async def upload_document(
             ".json",
         }
     ):
-
         raise HTTPException(
             422,
-            "Supported document files: "
-            "PDF, DOCX, TXT, Markdown, JSON",
+            "Supported document files: PDF, DOCX, TXT, Markdown, JSON",
         )
 
     raw = await file.read()
 
     if not raw:
-
         raise HTTPException(
             422,
             "Uploaded file is empty",
         )
 
-    checksum = hashlib.sha256(
-        raw
-    ).hexdigest()
+    checksum = hashlib.sha256(raw).hexdigest()
+
+    # --------------------------------------------------------
+    # Check for duplicate document
+    # --------------------------------------------------------
 
     with connection() as conn:
-
         existing = conn.execute(
             """
-            SELECT id,filename,chunks_json
+            SELECT id, filename, chunks_json
             FROM documents
-            WHERE owner_id=? AND checksum=?
+            WHERE owner_id = ? AND checksum = ?
             """,
             (
                 user["sub"],
@@ -2997,7 +3083,6 @@ async def upload_document(
         ).fetchone()
 
     if existing:
-
         return {
             "document_id": existing["id"],
             "filename": existing["filename"],
@@ -3010,7 +3095,15 @@ async def upload_document(
             "status": "indexed",
         }
 
+    # --------------------------------------------------------
+    # Generate document ID
+    # --------------------------------------------------------
+
     did = str(uuid.uuid4())
+
+    # --------------------------------------------------------
+    # Save physical document
+    # --------------------------------------------------------
 
     base_dir = (
         Path(settings.upload_dir)
@@ -3029,14 +3122,14 @@ async def upload_document(
 
     path.write_bytes(raw)
 
-    try:
+    # --------------------------------------------------------
+    # Extract text
+    # --------------------------------------------------------
 
-        content = DocumentParser.extract_text(
-            path
-        )
+    try:
+        content = DocumentParser.extract_text(path)
 
     except Exception as exc:
-
         path.unlink(
             missing_ok=True
         )
@@ -3047,7 +3140,6 @@ async def upload_document(
         ) from exc
 
     if not content.strip():
-
         path.unlink(
             missing_ok=True
         )
@@ -3056,6 +3148,10 @@ async def upload_document(
             422,
             "No readable text was found in this document",
         )
+
+    # --------------------------------------------------------
+    # Chunk document
+    # --------------------------------------------------------
 
     chunks = DocumentChunker(
         chunk_size=900,
@@ -3074,31 +3170,27 @@ async def upload_document(
         document_embeddings().collection_name,
     )
 
-    try:
+    # --------------------------------------------------------
+    # Generate embeddings / RAG indexing
+    # --------------------------------------------------------
 
+    try:
         document_embeddings().embed_chunks(
             [
                 {
                     "text": chunk,
                     "document_id": did,
-                    "owner_id": str(
-                        user["sub"]
-                    ),
+                    "owner_id": str(user["sub"]),
                     "filename": file.filename,
-                    "chunk_id": (
-                        f"{did}:{index}"
-                    ),
+                    "chunk_id": f"{did}:{index}",
                     "upload_time": upload_time,
                     "checksum": checksum,
                 }
-                for index, chunk in enumerate(
-                    chunks
-                )
+                for index, chunk in enumerate(chunks)
             ]
         )
 
     except Exception as exc:
-
         path.unlink(
             missing_ok=True
         )
@@ -3107,6 +3199,10 @@ async def upload_document(
             503,
             f"Document indexing is unavailable: {exc}",
         ) from exc
+
+    # --------------------------------------------------------
+    # Save document metadata
+    # --------------------------------------------------------
 
     with connection() as conn:
 
@@ -3188,52 +3284,66 @@ async def upload_document(
     }
 
 
+# ============================================================
+# LIST DOCUMENTS
+# ============================================================
+
 @router.get("/documents")
 def list_documents(
     user: dict = Depends(current_user),
 ):
+    """Return documents whose original files still exist."""
 
     with connection() as conn:
-
         rows = conn.execute(
             """
             SELECT
-                id,
-                filename,
-                path,
-                file_type,
-                size_bytes,
-                checksum,
-                indexed_at,
-                created_at
+                id, filename, path, file_type, size_bytes,
+                checksum, indexed_at, created_at
             FROM documents
-            WHERE owner_id=?
+            WHERE owner_id = ?
             ORDER BY created_at DESC
             """,
             (user["sub"],),
         ).fetchall()
 
-    return [
-        {
-            "id": row["id"],
-            "filename": row["filename"],
-            "path": row["path"],
-            "file_type": row["file_type"],
-            "size_bytes": row["size_bytes"],
-            "checksum": row["checksum"],
-            "indexed_at": row["indexed_at"],
-            "created_at": row["created_at"],
-        }
-        for row in rows
-    ]
+    result = []
 
+    for row in rows:
+        file_path = _resolve_upload_path(
+            row["path"],
+            "documents",
+            row["id"],
+            row["file_type"] or "",
+        )
+
+        if file_path is None:
+            continue
+
+        result.append(
+            {
+                "id": row["id"],
+                "filename": row["filename"],
+                "path": str(file_path),
+                "file_type": row["file_type"],
+                "size_bytes": row["size_bytes"],
+                "checksum": row["checksum"],
+                "indexed_at": row["indexed_at"],
+                "created_at": row["created_at"],
+            }
+        )
+
+    return result
+
+# ============================================================
+# GET SINGLE DOCUMENT
+# ============================================================
 
 @router.get("/documents/{document_id}")
 def get_document(
     document_id: str,
     user: dict = Depends(current_user),
 ):
-
     with connection() as conn:
 
         row = conn.execute(
@@ -3249,7 +3359,7 @@ def get_document(
                 content,
                 created_at
             FROM documents
-            WHERE id=? AND owner_id=?
+            WHERE id = ? AND owner_id = ?
             """,
             (
                 document_id,
@@ -3258,7 +3368,6 @@ def get_document(
         ).fetchone()
 
     if not row:
-
         raise HTTPException(
             404,
             "Document not found",
@@ -3277,6 +3386,109 @@ def get_document(
     }
 
 
+# ============================================================
+# DATASET DOWNLOAD
+# ============================================================
+
+@router.get("/datasets/{dataset_id}/download")
+def download_dataset(
+    dataset_id: str,
+    user: dict = Depends(current_user),
+):
+    """Download a dataset as CSV."""
+
+    row, _ = load_dataset(
+        dataset_id,
+        user["sub"],
+    )
+
+    file_path = _resolve_upload_path(
+        row.get("path"),
+        "datasets",
+        dataset_id,
+        ".csv",
+    )
+
+    if file_path is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Dataset file no longer exists on the server.",
+        )
+
+    return FileResponse(
+        path=str(file_path),
+        filename=row["filename"],
+        media_type="text/csv",
+    )
+
+
+# ============================================================
+# DOCUMENT DOWNLOAD
+# ============================================================
+
+@router.get("/documents/{document_id}/download")
+def download_document(
+    document_id: str,
+    user: dict = Depends(current_user),
+):
+    """Download the original uploaded document."""
+
+    with connection() as conn:
+        row = conn.execute(
+            """
+            SELECT id, filename, path, file_type
+            FROM documents
+            WHERE id=? AND owner_id=?
+            """,
+            (document_id, user["sub"]),
+        ).fetchone()
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found.",
+        )
+
+    file_type = (row["file_type"] or "").lower()
+
+    file_path = _resolve_upload_path(
+        row["path"],
+        "documents",
+        document_id,
+        file_type,
+    )
+
+    if file_path is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Document file no longer exists on the server.",
+        )
+
+    media_types = {
+        ".pdf": "application/pdf",
+        ".txt": "text/plain",
+        ".md": "text/markdown",
+        ".markdown": "text/markdown",
+        ".json": "application/json",
+        ".docx": (
+            "application/vnd.openxmlformats-officedocument."
+            "wordprocessingml.document"
+        ),
+    }
+
+    return FileResponse(
+        path=str(file_path),
+        filename=row["filename"],
+        media_type=media_types.get(
+            file_type,
+            "application/octet-stream",
+        ),
+    )
+
+# ============================================================
+# DELETE DOCUMENT
+# ============================================================
+
 @router.delete(
     "/documents/{document_id}",
     status_code=204,
@@ -3285,14 +3497,13 @@ def delete_document(
     document_id: str,
     user: dict = Depends(current_user),
 ):
-
     with connection() as conn:
 
         row = conn.execute(
             """
             SELECT path
             FROM documents
-            WHERE id=? AND owner_id=?
+            WHERE id = ? AND owner_id = ?
             """,
             (
                 document_id,
@@ -3301,7 +3512,6 @@ def delete_document(
         ).fetchone()
 
         if not row:
-
             raise HTTPException(
                 404,
                 "Document not found",
@@ -3309,26 +3519,42 @@ def delete_document(
 
         conn.execute(
             """
-            DELETE FROM documents
-            WHERE id=? AND owner_id=?
+            DELETE FROM uploads
+            WHERE document_id = ? AND owner_id = ?
             """,
-            (
-                document_id,
-                user["sub"],
-            ),
+            (document_id, user["sub"]),
         )
 
-    if row["path"]:
-
-        Path(
-            row["path"]
-        ).unlink(
-            missing_ok=True
+        conn.execute(
+            """
+            DELETE FROM documents
+            WHERE id = ? AND owner_id = ?
+            """,
+            (document_id, user["sub"]),
         )
 
-    document_embeddings().delete_document(
-        document_id
+    file_path = _resolve_upload_path(
+        row["path"],
+        "documents",
+        document_id,
+        Path(row["path"]).suffix if row["path"] else "",
     )
+
+    if file_path is not None:
+        file_path.unlink(missing_ok=True)
+
+    # Remove document embeddings
+    try:
+        document_embeddings().delete_document(
+            document_id
+        )
+    except Exception as exc:
+        logger.warning(
+            "Document embeddings could not be deleted "
+            "for document_id={}: {}",
+            document_id,
+            exc,
+        )
 
 
 # ============================================================
@@ -3424,7 +3650,6 @@ DOCUMENT CONTEXT:
 # RAG QUERY
 # ============================================================
 
-@router.post("/rag/query")
 @router.post("/rag/query")
 def rag_query(body: dict[str, str], user: dict = Depends(current_user)):
     q = body.get("question", "").strip()
