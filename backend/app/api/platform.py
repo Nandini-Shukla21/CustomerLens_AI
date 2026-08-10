@@ -145,31 +145,56 @@ def _resolve_upload_path(
     file_id: str,
     suffix: str = ".csv",
 ) -> Path | None:
-    """Resolve an uploaded file from its stored or expected path."""
+    """Resolve an uploaded file using the stored path or known upload locations."""
 
     candidates: list[Path] = []
 
+    # 1. Stored path from database
     if stored_path:
-        candidates.append(Path(stored_path))
+        stored = Path(stored_path)
 
+        if stored.is_absolute():
+            candidates.append(stored)
+        else:
+            # Relative to current working directory
+            candidates.append(Path.cwd() / stored)
+
+            # Relative to backend directory
+            backend_root = Path(__file__).resolve().parents[2]
+            candidates.append(backend_root / stored)
+
+    # 2. Current configured upload directory
     upload_root = Path(settings.upload_dir)
+
+    if not upload_root.is_absolute():
+        upload_root = Path.cwd() / upload_root
+
     candidates.append(
-        upload_root / category / f"{file_id}{suffix}"
+        upload_root
+        / category
+        / f"{file_id}{suffix}"
     )
 
-    project_root = Path(__file__).resolve().parents[2]
+    # 3. Backend-relative upload directory
+    backend_root = Path(__file__).resolve().parents[2]
+
     candidates.append(
-        project_root / upload_root / category / f"{file_id}{suffix}"
+        backend_root
+        / "uploads"
+        / category
+        / f"{file_id}{suffix}"
     )
 
+    # Return the first existing file
     for candidate in candidates:
         try:
             resolved = candidate.expanduser().resolve()
-        except OSError:
-            resolved = candidate.expanduser()
 
-        if resolved.is_file():
-            return resolved
+            if resolved.is_file():
+                return resolved
+
+        except OSError:
+            continue
 
     return None
 
@@ -3106,9 +3131,9 @@ async def upload_document(
     # --------------------------------------------------------
 
     base_dir = (
-        Path(settings.upload_dir)
-        / "documents"
-    )
+      Path(settings.upload_dir)
+      / "documents"
+    ).resolve()
 
     base_dir.mkdir(
         parents=True,
@@ -3292,14 +3317,20 @@ async def upload_document(
 def list_documents(
     user: dict = Depends(current_user),
 ):
-    """Return documents whose original files still exist."""
+    """Return all documents belonging to the current user."""
 
     with connection() as conn:
         rows = conn.execute(
             """
             SELECT
-                id, filename, path, file_type, size_bytes,
-                checksum, indexed_at, created_at
+                id,
+                filename,
+                path,
+                file_type,
+                size_bytes,
+                checksum,
+                indexed_at,
+                created_at
             FROM documents
             WHERE owner_id = ?
             ORDER BY created_at DESC
@@ -3317,14 +3348,11 @@ def list_documents(
             row["file_type"] or "",
         )
 
-        if file_path is None:
-            continue
-
         result.append(
             {
                 "id": row["id"],
                 "filename": row["filename"],
-                "path": str(file_path),
+                "path": str(file_path or row["path"]),
                 "file_type": row["file_type"],
                 "size_bytes": row["size_bytes"],
                 "checksum": row["checksum"],
@@ -3334,7 +3362,6 @@ def list_documents(
         )
 
     return result
-
 # ============================================================
 # GET SINGLE DOCUMENT
 # ============================================================
