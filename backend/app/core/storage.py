@@ -37,6 +37,16 @@ def initialize_database() -> None:
         CREATE TABLE IF NOT EXISTS predictions (id TEXT PRIMARY KEY, customer_id TEXT, dataset_id TEXT, prediction TEXT NOT NULL, probability REAL NOT NULL, confidence REAL NOT NULL, explanation_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
         CREATE TABLE IF NOT EXISTS chat_history (id TEXT PRIMARY KEY, user_id INTEGER, question TEXT NOT NULL, answer TEXT NOT NULL, sources_json TEXT NOT NULL, confidence REAL NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
         CREATE TABLE IF NOT EXISTS insights (id TEXT PRIMARY KEY, dataset_id TEXT, title TEXT NOT NULL, description TEXT NOT NULL, priority TEXT NOT NULL, confidence REAL NOT NULL, action TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+        CREATE TABLE IF NOT EXISTS activity_log (
+    id TEXT PRIMARY KEY,
+    owner_id INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT,
+    entity_name TEXT NOT NULL,
+    metadata_json TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
         CREATE TABLE IF NOT EXISTS uploads (id TEXT PRIMARY KEY, dataset_id TEXT, document_id TEXT, owner_id INTEGER, filename TEXT NOT NULL, file_type TEXT, size_bytes INTEGER DEFAULT 0, status TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(owner_id) REFERENCES users(id));
         """)
         # SQLite cannot add a NOT NULL column without a value to an existing table.
