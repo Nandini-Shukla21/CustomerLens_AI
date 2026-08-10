@@ -56,6 +56,9 @@ export const platformApi = {
   dashboard: () =>
     api.get("/dashboard").then((r) => r.data),
 
+
+   
+  
   // ==========================================================
   // DATASETS
   // ==========================================================
@@ -332,6 +335,7 @@ export const platformApi = {
     api
       .get("/activity")
       .then((r) => r.data),
+      
 
   // ==========================================================
   // UPLOAD
@@ -391,3 +395,32 @@ export const platformApi = {
       .then((r) => r.data);
   },
 };
+
+export type HomeOverview = {
+  metrics: {
+    datasets: number;
+    documents: number;
+    customers: number;
+    rows: number;
+  };
+
+  datasets: Dataset[];
+
+  documents: DocumentItem[];
+
+  activity: {
+    who: string;
+    what: string;
+    when: string;
+    type: string;
+  }[];
+
+  trend: {
+    date: string;
+    uploads: number;
+    deletions: number;
+  }[];
+
+  
+};
+
