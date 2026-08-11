@@ -14,14 +14,35 @@ def _get_user_id(user: Any) -> int:
     """
     Extract the authenticated user's ID.
 
-    Supports both:
-    - dictionary-like users
-    - objects with an id attribute
-    """
-    if isinstance(user, dict):
-        return int(user["id"])
+    The current_user() function returns the decoded JWT payload,
+    which contains the user's ID in the `sub` field.
 
-    return int(user.id)
+    Supports:
+    - JWT dictionary: {"sub": "1", "role": "Viewer", ...}
+    - Dictionary with an `id` field
+    - Objects with an `id` attribute
+    """
+
+    if isinstance(user, dict):
+        # JWT created by security.py uses `sub` as the user ID.
+        if "sub" in user:
+            return int(user["sub"])
+
+        # Fallback if another authentication flow provides `id`.
+        if "id" in user:
+            return int(user["id"])
+
+        raise ValueError(
+            "Authenticated user does not contain 'sub' or 'id'"
+        )
+
+    # Support object-style users.
+    if hasattr(user, "id"):
+        return int(user.id)
+
+    raise ValueError(
+        "Unable to extract user ID from authenticated user"
+    )
 
 
 @router.get("/summary")
@@ -89,7 +110,11 @@ def home_summary(
                 "checksum": row["checksum"],
                 "indexed_at": row["indexed_at"],
                 "created_at": row["created_at"],
-                "status": "indexed" if row["indexed_at"] else "uploaded",
+                "status": (
+                    "indexed"
+                    if row["indexed_at"]
+                    else "uploaded"
+                ),
             }
             for row in document_rows
         ]
@@ -274,8 +299,12 @@ def home_summary(
         "stats": {
             "datasets": len(datasets),
             "documents": len(documents),
-            "customers": int(customer_stats["total_customers"] or 0),
-            "revenue": float(customer_stats["total_revenue"] or 0),
+            "customers": int(
+                customer_stats["total_customers"] or 0
+            ),
+            "revenue": float(
+                customer_stats["total_revenue"] or 0
+            ),
             "transactions": float(
                 customer_stats["total_transactions"] or 0
             ),
