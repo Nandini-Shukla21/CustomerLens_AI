@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import dashboard, prediction, query, upload, chat, insights, datasets, home, auth, platform
+from app.api import dashboard, prediction, query, upload, chat, analytics, copilot, reports, insights, datasets, home, auth, platform
 from app.config import settings
 from app.core.logging import configure_logging
 from app.core.storage import initialize_database
