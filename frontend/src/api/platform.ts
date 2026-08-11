@@ -15,12 +15,98 @@ export type Dataset = {
 export type DocumentItem = {
   id: string;
   filename: string;
-  path: string;
-  file_type: string;
-  size_bytes: number;
+  path?: string;
+  file_type?: string;
+  size_bytes?: number;
   checksum?: string;
   indexed_at?: string;
   created_at: string;
+};
+
+export type HomeDocument = {
+  id: string;
+  filename: string;
+  checksum?: string;
+  indexed_at?: string;
+  created_at: string;
+  status: string;
+};
+
+export type HomeActivity = {
+  id: string;
+  who: string;
+  what: string;
+  when: string;
+  type: string;
+};
+
+export type RecentActivity = {
+  id: string;
+  action: string;
+  entity_type: string;
+  entity_id?: string;
+  entity_name: string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+};
+
+export type Insight = {
+  id: string;
+  dataset_id?: string;
+  title: string;
+  description: string;
+  priority: string;
+  confidence: number;
+  action: string;
+  created_at: string;
+};
+
+export type HomeOverview = {
+  stats: {
+    datasets: number;
+    documents: number;
+    customers: number;
+    revenue: number;
+    transactions: number;
+    average_ltv: number;
+    average_risk: number;
+    average_churn: number;
+    predictions: number;
+    average_prediction_probability: number;
+    average_prediction_confidence: number;
+    total_uploads: number;
+    total_size_bytes: number;
+  };
+
+  datasets: Dataset[];
+
+  documents: HomeDocument[];
+
+  /*
+   * This is the format expected by _app.home.tsx.
+   * It is created from the backend's recent_activity.
+   */
+  activity: HomeActivity[];
+
+  /*
+   * Raw activity returned by the backend.
+   */
+  recent_activity: RecentActivity[];
+
+  insights: Insight[];
+
+  charts: {
+    uploads: {
+      date: string;
+      count: number;
+    }[];
+
+    datasets: {
+      name: string;
+      rows: number;
+      columns: number;
+    }[];
+  };
 };
 
 export type UploadResult = {
@@ -54,17 +140,80 @@ export const platformApi = {
   // ==========================================================
 
   dashboard: () =>
-    api.get("/dashboard").then((r) => r.data),
+    api
+      .get("/dashboard")
+      .then((r) => r.data),
 
+  // ==========================================================
+  // HOME OVERVIEW
+  // ==========================================================
 
-   
-  
+  home: async (): Promise<HomeOverview> => {
+    const response = await api.get("/home/summary");
+
+    const data = response.data;
+
+    /*
+     * Backend returns `recent_activity`.
+     *
+     * The current home page expects:
+     *   who
+     *   what
+     *   when
+     *   type
+     *
+     * Convert the backend format here so we don't have
+     * to change the UI component.
+     */
+    const activity: HomeActivity[] = (
+      data.recent_activity ?? []
+    ).map((item: RecentActivity) => ({
+      id: item.id,
+      who: item.entity_name || "System",
+      what: item.action || "performed an action",
+      when: item.created_at,
+      type: item.entity_type || "activity",
+    }));
+
+    return {
+      ...data,
+      activity,
+    };
+  },
+
+  // ==========================================================
+  // HOME SUMMARY
+  // ==========================================================
+
+  homeSummary: async (): Promise<HomeOverview> => {
+    const response = await api.get("/home/summary");
+
+    const data = response.data;
+
+    const activity: HomeActivity[] = (
+      data.recent_activity ?? []
+    ).map((item: RecentActivity) => ({
+      id: item.id,
+      who: item.entity_name || "System",
+      what: item.action || "performed an action",
+      when: item.created_at,
+      type: item.entity_type || "activity",
+    }));
+
+    return {
+      ...data,
+      activity,
+    };
+  },
+
   // ==========================================================
   // DATASETS
   // ==========================================================
 
   datasets: () =>
-    api.get<Dataset[]>("/datasets").then((r) => r.data),
+    api
+      .get<Dataset[]>("/datasets")
+      .then((r) => r.data),
 
   dataset: (id: string) =>
     api
@@ -248,7 +397,9 @@ export const platformApi = {
   reportsDashboard: (dataset_id?: string) =>
     api
       .get("/reports/dashboard", {
-        params: dataset_id ? { dataset_id } : {},
+        params: dataset_id
+          ? { dataset_id }
+          : {},
       })
       .then((r) => r.data),
 
@@ -256,7 +407,10 @@ export const platformApi = {
   // RAG / COPILOT
   // ==========================================================
 
-  copilot: (question: string, dataset_id?: string) =>
+  copilot: (
+    question: string,
+    dataset_id?: string,
+  ) =>
     api
       .post("/rag/query", {
         question,
@@ -264,7 +418,10 @@ export const platformApi = {
       })
       .then((r) => r.data),
 
-  chat: (question: string, dataset_id?: string) =>
+  chat: (
+    question: string,
+    dataset_id?: string,
+  ) =>
     api
       .post("/rag/query", {
         question,
@@ -314,7 +471,9 @@ export const platformApi = {
   insights: (dataset_id?: string) =>
     api
       .get("/insights", {
-        params: dataset_id ? { dataset_id } : {},
+        params: dataset_id
+          ? { dataset_id }
+          : {},
       })
       .then((r) => r.data),
 
@@ -335,7 +494,6 @@ export const platformApi = {
     api
       .get("/activity")
       .then((r) => r.data),
-      
 
   // ==========================================================
   // UPLOAD
@@ -395,32 +553,3 @@ export const platformApi = {
       .then((r) => r.data);
   },
 };
-
-export type HomeOverview = {
-  metrics: {
-    datasets: number;
-    documents: number;
-    customers: number;
-    rows: number;
-  };
-
-  datasets: Dataset[];
-
-  documents: DocumentItem[];
-
-  activity: {
-    who: string;
-    what: string;
-    when: string;
-    type: string;
-  }[];
-
-  trend: {
-    date: string;
-    uploads: number;
-    deletions: number;
-  }[];
-
-  
-};
-
