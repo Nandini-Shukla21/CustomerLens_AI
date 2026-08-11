@@ -27,7 +27,10 @@ def create_app() -> FastAPI:
     app.include_router(upload.router, prefix="/api/upload", tags=["upload-legacy"])
     app.include_router(query.router, prefix="/api/v1/query", tags=["query"])
     app.include_router(dashboard.router, prefix="/api/v1/dashboard", tags=["dashboard"])
-    app.include_router(prediction.router, prefix="/api/v1/prediction", tags=["prediction"])
+    app.include_router(analytics.router, prefix="/api/v1", tags=["analytics"])
+    app.include_router(reports.router, prefix="/api/v1", tags=["reports"])
+    app.include_router(copilot.router, prefix="/api/v1", tags=["copilot"])
+    app.include_router(prediction.router, prefix="/api/v1", tags=["prediction"])
     app.include_router(chat.router, prefix="/api/v1/chat", tags=["chat"])
     app.include_router(home.router, prefix="/api/v1/home", tags=["home"])
   
