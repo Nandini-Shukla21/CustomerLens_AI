@@ -12,10 +12,9 @@ from typing import Any
 from io import BytesIO
 
 import pandas as pd
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
-from fastapi.responses import StreamingResponse
-from loguru import logger
 
+from fastapi.responses import FileResponse, StreamingResponse
+from loguru import logger
 from app.config import settings
 from app.core.security import current_user
 from app.core.storage import connection, decode_json, row_dict
@@ -24,7 +23,14 @@ from app.rag.chunker import DocumentChunker
 from app.services.embedding_service import EmbeddingService
 from app.services.groq_service import GroqService
 
-
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    UploadFile,
+)
 router = APIRouter()
 
 
@@ -133,6 +139,41 @@ def norm(columns: list[str], names: list[str]) -> str | None:
     )
 
 
+def _resolve_upload_path(
+    stored_path: str | Path | None,
+    category: str,
+    file_id: str,
+    suffix: str = ".csv",
+) -> Path | None:
+    """Resolve an uploaded file from its stored or expected path."""
+
+    candidates: list[Path] = []
+
+    if stored_path:
+        candidates.append(Path(stored_path))
+
+    upload_root = Path(settings.upload_dir)
+    candidates.append(
+        upload_root / category / f"{file_id}{suffix}"
+    )
+
+    project_root = Path(__file__).resolve().parents[2]
+    candidates.append(
+        project_root / upload_root / category / f"{file_id}{suffix}"
+    )
+
+    for candidate in candidates:
+        try:
+            resolved = candidate.expanduser().resolve()
+        except OSError:
+            resolved = candidate.expanduser()
+
+        if resolved.is_file():
+            return resolved
+
+    return None
+
+
 def load_dataset(
     dataset_id: str,
     owner_id: str | None = None,
@@ -158,15 +199,26 @@ def load_dataset(
     if not row:
         raise HTTPException(404, "Dataset not found")
 
-    try:
-        return row, pd.read_csv(row["path"])
+    file_path = _resolve_upload_path(
+        row.get("path"),
+        "datasets",
+        dataset_id,
+        ".csv",
+    )
 
+    if file_path is None:
+        raise HTTPException(
+            404,
+            "Dataset file no longer exists on the server",
+        )
+
+    try:
+        return row, pd.read_csv(file_path)
     except Exception as exc:
         raise HTTPException(
             500,
             "Dataset file cannot be read",
         ) from exc
-
 
 # ============================================================
 # DATASET METRICS
@@ -361,7 +413,7 @@ def live_insights(
 # STRUCTURED CSV / DATASET ANSWERS
 # ============================================================
 
-def structured_answer(question: str, user_id: str) -> dict[str, Any] | None:
+def structured_answer(question: str, user_id: str, dataset_id: str | None = None) -> dict[str, Any] | None:
     """
     Answer analytical questions directly from uploaded structured datasets.
 
@@ -381,13 +433,19 @@ def structured_answer(question: str, user_id: str) -> dict[str, Any] | None:
     text = question.lower().strip()
 
     # ---------------------------------------------------------
-    # Load all datasets belonging to the current user
+    # Load the requested dataset or all datasets belonging to the current user
     # ---------------------------------------------------------
     with connection() as conn:
-        rows = conn.execute(
-            "SELECT id, filename, path FROM datasets WHERE owner_id=?",
-            (user_id,),
-        ).fetchall()
+        if dataset_id:
+            rows = conn.execute(
+                "SELECT id, filename, path FROM datasets WHERE owner_id=? AND id=?",
+                (user_id, dataset_id),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, filename, path FROM datasets WHERE owner_id=?",
+                (user_id,),
+            ).fetchall()
 
     if not rows:
         return {
@@ -662,6 +720,25 @@ def structured_answer(question: str, user_id: str) -> dict[str, Any] | None:
             "spend",
         ],
     )
+
+    # salary / pay
+    salary = find_column(
+        frame,
+        ["salary", "pay", "income", "compensation"]
+    )
+
+    # air quality / sensors
+    aqi = find_column(frame, ["aqi", "air_quality", "airquality"]) or find_column(frame, ["aqi_index"]) 
+    pm25 = find_column(frame, ["pm25", "pm_25", "pm_2_5"]) or find_column(frame, ["pm2_5"]) 
+    pm10 = find_column(frame, ["pm10", "pm_10"]) 
+    no2 = find_column(frame, ["no2"]) 
+    so2 = find_column(frame, ["so2"]) 
+    o3 = find_column(frame, ["o3"]) 
+    co = find_column(frame, ["co"]) 
+    temperature = find_column(frame, ["temperature", "temp"]) 
+    humidity = find_column(frame, ["humidity"]) 
+    country = find_column(frame, ["country"]) 
+    city = find_column(frame, ["city"])
 
     churn = find_column(
         frame,
@@ -1039,6 +1116,98 @@ def structured_answer(question: str, user_id: str) -> dict[str, Any] | None:
             "sources": [filename],
             "confidence": 0.99,
         }
+
+    # ---------------------------------------------------------
+    # 14. Salary queries (pay/income)
+    # ---------------------------------------------------------
+    if salary and ("salary" in text or "pay" in text or "income" in text):
+        values = pd.to_numeric(frame[salary], errors="coerce").dropna()
+
+        if values.empty:
+            return {
+                "answer": f"No valid salary values were found in {filename}.",
+                "sources": [filename],
+                "confidence": 0.0,
+            }
+
+        if "average" in text or "mean" in text:
+            return {
+                "answer": f"The average {salary} is {values.mean():.2f} in {filename}.",
+                "sources": [filename],
+                "confidence": 0.99,
+            }
+
+        if "highest" in text or "maximum" in text or "who has the highest" in text:
+            idx = values.idxmax()
+            who = frame.loc[idx, name] if name else (frame.loc[idx, customer_id] if customer_id else str(idx))
+            return {
+                "answer": f"The highest {salary} is {values.max():.2f}, belonging to {who} in {filename}.",
+                "sources": [filename],
+                "confidence": 0.99,
+            }
+
+    # ---------------------------------------------------------
+    # 15. Air quality and pollutant queries
+    # ---------------------------------------------------------
+    # Average AQI or pollutant
+    pollutant_map = {
+        "aqi": aqi,
+        "pm25": pm25,
+        "pm10": pm10,
+        "no2": no2,
+        "so2": so2,
+        "o3": o3,
+        "co": co,
+        "temperature": temperature,
+        "humidity": humidity,
+    }
+
+    for keyword, col in pollutant_map.items():
+        if col and keyword in text:
+            vals = pd.to_numeric(frame[col], errors="coerce").dropna()
+            if vals.empty:
+                return {"answer": f"No valid {keyword} values were found in {filename}.", "sources": [filename], "confidence": 0.0}
+
+            if "average" in text or "mean" in text:
+                return {"answer": f"The average {keyword} is {vals.mean():.2f} in {filename}.", "sources": [filename], "confidence": 0.99}
+
+            if "highest" in text or "maximum" in text:
+                idx = vals.idxmax()
+                location = None
+                if city:
+                    location = str(frame.loc[idx, city])
+                elif country:
+                    location = str(frame.loc[idx, country])
+                else:
+                    location = str(idx)
+
+                return {"answer": f"The highest {keyword} is {vals.max():.2f} at {location} in {filename}.", "sources": [filename], "confidence": 0.99}
+
+    # ---------------------------------------------------------
+    # 16. Generic numeric column average by name found in question
+    # ---------------------------------------------------------
+    # Attempt to match any column mentioned in the question and compute an average
+    mapped = normalized_column_map(frame)
+    for norm_name, original in mapped.items():
+        if norm_name in text and original in frame.columns:
+            # compute average if numeric
+            vals = pd.to_numeric(frame[original], errors="coerce").dropna()
+            if not vals.empty and ("average" in text or "mean" in text or "highest" in text or "lowest" in text):
+                if "average" in text or "mean" in text:
+                    return {"answer": f"The average {original} is {vals.mean():.2f} in {filename}.", "sources": [filename], "confidence": 0.99}
+                if "highest" in text or "maximum" in text:
+                    idx = vals.idxmax()
+                    identifier = None
+                    if name:
+                        identifier = str(frame.loc[idx, name])
+                    elif customer_id:
+                        identifier = str(frame.loc[idx, customer_id])
+                    else:
+                        identifier = str(idx)
+                    return {"answer": f"The highest {original} is {vals.max():.2f}, belonging to {identifier} in {filename}.", "sources": [filename], "confidence": 0.99}
+                if "lowest" in text or "minimum" in text:
+                    idx = vals.idxmin()
+                    return {"answer": f"The lowest {original} is {vals.min():.2f} in {filename}.", "sources": [filename], "confidence": 0.99}
 
     # ---------------------------------------------------------
     # 7. Average numeric metric by department
@@ -1579,22 +1748,43 @@ async def upload_dataset(
 def datasets(
     user: dict = Depends(current_user),
 ):
+    """Return datasets whose CSV files still exist."""
 
     with connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, filename, path, rows, columns, created_at
+            FROM datasets
+            WHERE owner_id=?
+            ORDER BY created_at DESC
+            """,
+            (user["sub"],),
+        ).fetchall()
 
-        return [
-            dict(r)
-            for r in conn.execute(
-                """
-                SELECT id,filename,rows,columns,created_at
-                FROM datasets
-                WHERE owner_id=?
-                ORDER BY created_at DESC
-                """,
-                (user["sub"],),
-            ).fetchall()
-        ]
+    result = []
 
+    for row in rows:
+        file_path = _resolve_upload_path(
+            row["path"],
+            "datasets",
+            row["id"],
+            ".csv",
+        )
+
+        if file_path is None:
+            continue
+
+        result.append(
+            {
+                "id": row["id"],
+                "filename": row["filename"],
+                "rows": row["rows"],
+                "columns": row["columns"],
+                "created_at": row["created_at"],
+            }
+        )
+
+    return result
 
 @router.get("/uploads")
 def upload_history(
@@ -1749,34 +1939,89 @@ def delete_dataset(
         user["sub"],
     )
 
+    file_path = _resolve_upload_path(
+        row.get("path"),
+        "datasets",
+        dataset_id,
+        ".csv",
+    )
+
     with connection() as conn:
+        conn.execute(
+            "DELETE FROM uploads WHERE dataset_id=? AND owner_id=?",
+            (dataset_id, user["sub"]),
+        )
 
         conn.execute(
-            "DELETE FROM datasets WHERE id=?",
+            "DELETE FROM customers WHERE dataset_id=?",
             (dataset_id,),
         )
 
-    Path(
-        row["path"]
-    ).unlink(
-        missing_ok=True
-    )
+        conn.execute(
+            "DELETE FROM predictions WHERE dataset_id=?",
+            (dataset_id,),
+        )
 
+        conn.execute(
+            "DELETE FROM datasets WHERE id=? AND owner_id=?",
+            (dataset_id, user["sub"]),
+        )
+
+    if file_path is not None:
+        file_path.unlink(missing_ok=True)
 
 # ============================================================
 # DASHBOARD
 # ============================================================
 
 @router.get("/dashboard")
-def dashboard(
-    user: dict = Depends(current_user),
-):
+def dashboard(user: dict = Depends(current_user)):
+    """
+    Return dashboard data for the most recently uploaded dataset.
 
+    This endpoint is kept for backward compatibility.
+    The frontend should preferably use:
+        GET /dashboard/datasets
+        GET /dashboard/datasets/{dataset_id}
+    """
     with connection() as conn:
+        row = conn.execute(
+            """
+            SELECT id
+            FROM datasets
+            WHERE owner_id=?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (user["sub"],),
+        ).fetchone()
 
+    if not row:
+        return {
+            "dataset": None,
+            "kpis": metrics(pd.DataFrame()),
+            "charts": [],
+        }
+
+    return dashboard_dataset(row["id"], user)
+
+@router.get("/dashboard/datasets")
+def dashboard_datasets(user: dict = Depends(current_user)):
+    """
+    Return all datasets available to the current user.
+
+    The frontend uses this list to display selectable dataset cards/tabs
+    on the dashboard.
+    """
+    with connection() as conn:
         rows = conn.execute(
             """
-            SELECT *
+            SELECT
+                id,
+                filename,
+                rows,
+                columns,
+                created_at
             FROM datasets
             WHERE owner_id=?
             ORDER BY created_at DESC
@@ -1784,155 +2029,510 @@ def dashboard(
             (user["sub"],),
         ).fetchall()
 
-        uploads = [
-            dict(r)
-            for r in conn.execute(
-                """
-                SELECT filename,status,created_at
-                FROM uploads
-                ORDER BY created_at DESC
-                LIMIT 5
-                """
-            ).fetchall()
-        ]
+    return [
+        {
+            "id": row["id"],
+            "filename": row["filename"],
+            "rows": int(row["rows"]),
+            "columns": int(row["columns"]),
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]
 
-    frames = []
+@router.get("/dashboard/datasets/{dataset_id}")
+def dashboard_dataset(
+    dataset_id: str,
+    user: dict = Depends(current_user),
+):
+    """
+    Generate a dashboard dynamically from ONE selected dataset.
 
-    for row in rows:
+    The function detects:
+    - numeric columns
+    - categorical columns
+    - date columns
 
-        try:
-            frames.append(
-                pd.read_csv(row["path"])
+    and automatically creates suitable chart data.
+    """
+
+    row, frame = load_dataset(dataset_id, user["sub"])
+
+    if frame.empty:
+        return {
+            "dataset": {
+                "id": dataset_id,
+                "filename": row["filename"],
+                "rows": 0,
+                "columns": 0,
+            },
+            "kpis": {},
+            "charts": [],
+        }
+
+    # ---------------------------------------------------------
+    # BASIC INFORMATION
+    # ---------------------------------------------------------
+
+    columns = [str(column) for column in frame.columns]
+
+    numeric_columns = [
+        str(column)
+        for column in frame.select_dtypes(include="number").columns
+    ]
+
+    categorical_columns = [
+        str(column)
+        for column in frame.select_dtypes(
+            include=["object", "category", "bool"]
+        ).columns
+    ]
+
+    # ---------------------------------------------------------
+    # DETECT DATE COLUMNS
+    # ---------------------------------------------------------
+
+    date_columns = []
+
+    for column in frame.columns:
+        column_name = str(column).lower()
+
+        if any(
+            keyword in column_name
+            for keyword in [
+                "date",
+                "time",
+                "timestamp",
+                "created",
+                "updated",
+            ]
+        ):
+            converted = pd.to_datetime(
+                frame[column],
+                errors="coerce",
             )
 
-        except Exception:
-            continue
+            if converted.notna().sum() > 0:
+                date_columns.append(str(column))
 
-    frame = (
-        pd.concat(
-            frames,
-            ignore_index=True,
+    # ---------------------------------------------------------
+    # KPI DATA
+    # ---------------------------------------------------------
+
+    kpis = {
+        "total_records": int(len(frame)),
+        "total_columns": int(len(frame.columns)),
+        "numeric_columns": int(len(numeric_columns)),
+        "categorical_columns": int(len(categorical_columns)),
+        "missing_values": int(frame.isna().sum().sum()),
+        "duplicate_rows": int(frame.duplicated().sum()),
+    }
+
+    # ---------------------------------------------------------
+    # CHARTS
+    # ---------------------------------------------------------
+
+    charts = []
+
+    # =========================================================
+    # CHART 1
+    # CATEGORICAL DISTRIBUTION
+    # =========================================================
+
+    if categorical_columns:
+
+        selected_column = None
+
+        # Prefer meaningful categorical columns.
+        preferred_keywords = [
+            "department",
+            "dept",
+            "category",
+            "segment",
+            "gender",
+            "status",
+            "type",
+            "region",
+            "state",
+            "city",
+            "joblevel",
+        ]
+
+        for keyword in preferred_keywords:
+            selected_column = next(
+                (
+                    column
+                    for column in categorical_columns
+                    if keyword in column.lower()
+                ),
+                None,
+            )
+
+            if selected_column:
+                break
+
+        if selected_column is None:
+            selected_column = categorical_columns[0]
+
+        counts = (
+            frame[selected_column]
+            .fillna("Unknown")
+            .astype(str)
+            .value_counts()
+            .head(10)
         )
-        if frames
-        else pd.DataFrame()
-    )
 
-    result = (
-        metrics(frame)
-        if not frame.empty
-        else metrics(pd.DataFrame())
-    )
-
-    segment = norm(
-        list(frame.columns),
-        ["segment", "customer_segment"],
-    )
-
-    risk = norm(
-        list(frame.columns),
-        ["risk", "risk_score"],
-    )
-
-    date = norm(
-        list(frame.columns),
-        [
-            "date",
-            "transaction_date",
-            "created_at",
-        ],
-    )
-
-    revenue = norm(
-        list(frame.columns),
-        ["revenue", "amount", "sales"],
-    )
-
-    result.update(
-        {
-            "datasets": len(rows),
-            "documents": 0,
-            "recent_uploads": uploads,
-
-            "segment_distribution": (
-                [
+        charts.append(
+            {
+                "id": "categorical_distribution",
+                "type": "bar",
+                "title": f"{selected_column} Distribution",
+                "description": f"Distribution of records by {selected_column}.",
+                "xKey": "category",
+                "series": [
                     {
-                        "name": str(k),
-                        "value": int(v),
+                        "dataKey": "count",
+                        "label": "Records",
                     }
-                    for k, v in
-                    frame[segment]
-                    .fillna("Unknown")
+                ],
+                "data": [
+                    {
+                        "category": str(category),
+                        "count": int(count),
+                    }
+                    for category, count in counts.items()
+                ],
+            }
+        )
+
+    # =========================================================
+    # CHART 2
+    # NUMERIC DISTRIBUTION
+    # =========================================================
+
+    if numeric_columns:
+
+        selected_numeric = None
+
+        preferred_numeric_keywords = [
+            "revenue",
+            "sales",
+            "amount",
+            "income",
+            "salary",
+            "age",
+            "experience",
+            "score",
+            "rating",
+            "satisfaction",
+        ]
+
+        for keyword in preferred_numeric_keywords:
+            selected_numeric = next(
+                (
+                    column
+                    for column in numeric_columns
+                    if keyword in column.lower()
+                ),
+                None,
+            )
+
+            if selected_numeric:
+                break
+
+        if selected_numeric is None:
+            selected_numeric = numeric_columns[0]
+
+        numeric_series = pd.to_numeric(
+            frame[selected_numeric],
+            errors="coerce",
+        ).dropna()
+
+        if not numeric_series.empty:
+
+            # Create sensible histogram buckets.
+            unique_count = numeric_series.nunique()
+
+            if unique_count <= 10:
+
+                distribution = (
+                    numeric_series
                     .value_counts()
-                    .items()
-                ]
-                if segment
-                else []
-            ),
+                    .sort_index()
+                )
 
-            "risk_distribution": (
-                [
+                chart_data = [
                     {
-                        "name": str(k),
-                        "value": int(v),
+                        "category": str(value),
+                        "count": int(count),
                     }
-                    for k, v in
-                    pd.cut(
-                        pd.to_numeric(
-                            frame[risk],
-                            errors="coerce",
-                        ).fillna(0),
-                        [-1, 0.3, 0.6, 1],
-                        labels=[
-                            "Low",
-                            "Medium",
-                            "High",
-                        ],
+                    for value, count in distribution.items()
+                ]
+
+            else:
+
+                minimum = float(numeric_series.min())
+                maximum = float(numeric_series.max())
+
+                if minimum == maximum:
+                    chart_data = [
+                        {
+                            "category": str(round(minimum, 2)),
+                            "count": int(len(numeric_series)),
+                        }
+                    ]
+
+                else:
+
+                    bins = 8
+
+                    bucketed = pd.cut(
+                        numeric_series,
+                        bins=bins,
+                        include_lowest=True,
                     )
-                    .value_counts()
-                    .items()
-                ]
-                if risk
-                else []
-            ),
 
-            "revenue_trend": [],
+                    distribution = bucketed.value_counts().sort_index()
 
-            "ai_insights": live_insights(
-                frame
-            ),
-        }
-    )
+                    chart_data = [
+                        {
+                            "category": str(interval),
+                            "count": int(count),
+                        }
+                        for interval, count in distribution.items()
+                    ]
 
-    if date and revenue:
+            charts.append(
+                {
+                    "id": "numeric_distribution",
+                    "type": "bar",
+                    "title": f"{selected_numeric} Distribution",
+                    "description": f"Distribution of {selected_numeric}.",
+                    "xKey": "category",
+                    "series": [
+                        {
+                            "dataKey": "count",
+                            "label": "Records",
+                        }
+                    ],
+                    "data": chart_data,
+                }
+            )
 
-        tmp = pd.DataFrame(
+    # =========================================================
+    # CHART 3
+    # CATEGORY VS NUMERIC
+    # =========================================================
+
+    if categorical_columns and numeric_columns:
+
+        category_column = None
+
+        preferred_category_keywords = [
+            "department",
+            "dept",
+            "segment",
+            "category",
+            "region",
+            "state",
+            "city",
+            "type",
+            "status",
+        ]
+
+        for keyword in preferred_category_keywords:
+            category_column = next(
+                (
+                    column
+                    for column in categorical_columns
+                    if keyword in column.lower()
+                ),
+                None,
+            )
+
+            if category_column:
+                break
+
+        if category_column is None:
+            category_column = categorical_columns[0]
+
+        numeric_column = None
+
+        preferred_numeric_keywords = [
+            "revenue",
+            "sales",
+            "amount",
+            "salary",
+            "experience",
+            "age",
+            "score",
+            "rating",
+            "satisfaction",
+        ]
+
+        for keyword in preferred_numeric_keywords:
+            numeric_column = next(
+                (
+                    column
+                    for column in numeric_columns
+                    if keyword in column.lower()
+                ),
+                None,
+            )
+
+            if numeric_column:
+                break
+
+        if numeric_column is None:
+            numeric_column = numeric_columns[0]
+
+        temp = frame[
+            [category_column, numeric_column]
+        ].copy()
+
+        temp[numeric_column] = pd.to_numeric(
+            temp[numeric_column],
+            errors="coerce",
+        )
+
+        temp = temp.dropna(subset=[numeric_column])
+
+        if not temp.empty:
+
+            grouped = (
+                temp.groupby(
+                    temp[category_column].fillna("Unknown").astype(str)
+                )[numeric_column]
+                .mean()
+                .sort_values(ascending=False)
+                .head(10)
+            )
+
+            charts.append(
+                {
+                    "id": "category_numeric_comparison",
+                    "type": "bar",
+                    "title": f"Average {numeric_column} by {category_column}",
+                    "description": (
+                        f"Average {numeric_column} across "
+                        f"{category_column}."
+                    ),
+                    "xKey": "category",
+                    "series": [
+                        {
+                            "dataKey": "value",
+                            "label": f"Average {numeric_column}",
+                        }
+                    ],
+                    "data": [
+                        {
+                            "category": str(category),
+                            "value": round(float(value), 2),
+                        }
+                        for category, value in grouped.items()
+                    ],
+                }
+            )
+
+    # =========================================================
+    # CHART 4
+    # DATE TREND
+    # =========================================================
+
+    if date_columns and numeric_columns:
+
+        date_column = date_columns[0]
+
+        numeric_column = None
+
+        preferred_numeric_keywords = [
+            "revenue",
+            "sales",
+            "amount",
+            "income",
+            "profit",
+            "value",
+        ]
+
+        for keyword in preferred_numeric_keywords:
+            numeric_column = next(
+                (
+                    column
+                    for column in numeric_columns
+                    if keyword in column.lower()
+                ),
+                None,
+            )
+
+            if numeric_column:
+                break
+
+        if numeric_column is None:
+            numeric_column = numeric_columns[0]
+
+        temp = pd.DataFrame(
             {
                 "date": pd.to_datetime(
-                    frame[date],
+                    frame[date_column],
                     errors="coerce",
                 ),
-
-                "revenue": pd.to_numeric(
-                    frame[revenue],
+                "value": pd.to_numeric(
+                    frame[numeric_column],
                     errors="coerce",
-                ).fillna(0),
+                ),
             }
         ).dropna()
 
-        result["revenue_trend"] = [
-            {
-                "period": str(k),
-                "revenue": float(v),
-            }
-            for k, v in
-            tmp.groupby(
-                tmp.date.dt.to_period("M")
-            )["revenue"]
-            .sum()
-            .items()
-        ]
+        if not temp.empty:
 
-    return result
+            temp["period"] = temp["date"].dt.to_period("M")
+
+            trend = (
+                temp.groupby("period")["value"]
+                .sum()
+                .sort_index()
+            )
+
+            charts.append(
+                {
+                    "id": "time_series",
+                    "type": "line",
+                    "title": f"{numeric_column} Trend",
+                    "description": (
+                        f"{numeric_column} over time."
+                    ),
+                    "xKey": "period",
+                    "series": [
+                        {
+                            "dataKey": "value",
+                            "label": numeric_column,
+                        }
+                    ],
+                    "data": [
+                        {
+                            "period": str(period),
+                            "value": round(float(value), 2),
+                        }
+                        for period, value in trend.items()
+                    ],
+                }
+            )
+
+    # ---------------------------------------------------------
+    # RETURN
+    # ---------------------------------------------------------
+
+    return {
+        "dataset": {
+            "id": dataset_id,
+            "filename": row["filename"],
+            "rows": int(row["rows"]),
+            "columns": int(row["columns"]),
+            "column_names": columns,
+        },
+        "kpis": kpis,
+        "charts": charts[:4],
+    }
 
 
 # ============================================================
@@ -2046,142 +2646,6 @@ def customer(
 
 
 # ============================================================
-# ANALYTICS
-# ============================================================
-
-@router.get("/analytics")
-def analytics(
-    dataset_id: str | None = None,
-    user: dict = Depends(current_user),
-):
-
-    if dataset_id:
-
-        _, frame = load_dataset(
-            dataset_id,
-            user["sub"],
-        )
-
-    else:
-
-        with connection() as conn:
-
-            row = conn.execute(
-                """
-                SELECT id
-                FROM datasets
-                WHERE owner_id=?
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-                (user["sub"],),
-            ).fetchone()
-
-        frame = (
-            load_dataset(
-                row["id"],
-                user["sub"],
-            )[1]
-            if row
-            else pd.DataFrame()
-        )
-
-    segment = norm(
-        list(frame.columns),
-        ["segment", "customer_segment"],
-    )
-
-    revenue = norm(
-        list(frame.columns),
-        [
-            "revenue",
-            "amount",
-            "sales",
-            "total_amount",
-            "spend",
-        ],
-    )
-
-    date = norm(
-        list(frame.columns),
-        [
-            "date",
-            "transaction_date",
-            "created_at",
-        ],
-    )
-
-    trends = []
-
-    if date and revenue:
-
-        tmp = pd.DataFrame(
-            {
-                "date": pd.to_datetime(
-                    frame[date],
-                    errors="coerce",
-                ),
-
-                "revenue": pd.to_numeric(
-                    frame[revenue],
-                    errors="coerce",
-                ).fillna(0),
-            }
-        ).dropna()
-
-        trends = [
-            {
-                "period": str(k),
-                "revenue": float(v),
-            }
-            for k, v in
-            tmp.groupby(
-                tmp.date.dt.to_period("M")
-            )["revenue"]
-            .sum()
-            .items()
-        ]
-
-    return {
-        "kpis": metrics(frame),
-        "columns": list(
-            map(str, frame.columns)
-        ),
-        "records": len(frame),
-        "revenue_trend": trends,
-        "segments": (
-            [
-                {
-                    "name": str(k),
-                    "value": int(v),
-                }
-                for k, v in
-                frame[segment]
-                .fillna("Unknown")
-                .value_counts()
-                .items()
-            ]
-            if segment
-            else []
-        ),
-    }
-
-
-# ============================================================
-# INSIGHTS
-# ============================================================
-
-@router.get("/insights")
-def insights(
-    user: dict = Depends(current_user),
-):
-
-    data = dashboard(user)
-
-    return data["ai_insights"]
-
-
-# ============================================================
 # ACTIVITY
 # ============================================================
 
@@ -2280,322 +2744,6 @@ def notifications(
 
 
 # ============================================================
-# PREDICTION
-# ============================================================
-
-@router.post("/predict")
-def predict(
-    body: dict[str, Any],
-    user: dict = Depends(current_user),
-):
-
-    customer_id = str(
-        body.get("customer_id", "")
-    )
-
-    features = body.get(
-        "features",
-        {},
-    )
-
-    records = customers(
-        customer_id,
-        200,
-        user,
-    )
-
-    customer = next(
-        (
-            x
-            for x in records
-            if x["id"] == customer_id
-        ),
-        None,
-    )
-
-    if not customer:
-
-        raise HTTPException(
-            404,
-            "Customer not found in your uploaded data",
-        )
-
-    dataset, frame = load_dataset(
-        customer["dataset_id"],
-        user["sub"],
-    )
-
-    target = norm(
-        list(frame.columns),
-        [
-            "churn",
-            "churn_score",
-            "churned",
-            "target",
-        ],
-    )
-
-    if not target:
-
-        raise HTTPException(
-            422,
-            "A churn/target column is required "
-            "to train predictions from this dataset",
-        )
-
-    numeric = [
-        str(c)
-        for c in frame.select_dtypes(
-            include="number"
-        ).columns
-        if str(c) != target
-    ]
-
-    if not numeric:
-
-        raise HTTPException(
-            422,
-            "The dataset needs numeric feature "
-            "columns to train predictions",
-        )
-
-    import joblib
-
-    model_dir = (
-        Path(settings.upload_dir)
-        / "models"
-    )
-
-    model_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    model_path = (
-        model_dir
-        / f"{dataset['id']}.joblib"
-    )
-
-    if model_path.exists():
-
-        artifact = joblib.load(
-            model_path
-        )
-
-        model = artifact["model"]
-        numeric = artifact["features"]
-
-    else:
-
-        from sklearn.impute import SimpleImputer
-        from sklearn.linear_model import LogisticRegression
-        from sklearn.pipeline import make_pipeline
-
-        y = (
-            pd.to_numeric(
-                frame[target],
-                errors="coerce",
-            )
-            .fillna(0)
-            >= 0.5
-        ).astype(int)
-
-        if y.nunique() < 2:
-
-            raise HTTPException(
-                422,
-                "The uploaded target column "
-                "needs both churn outcomes "
-                "to train the model",
-            )
-
-        model = make_pipeline(
-            SimpleImputer(
-                strategy="median"
-            ),
-            LogisticRegression(
-                max_iter=1000,
-                class_weight="balanced",
-            ),
-        )
-
-        X = frame[numeric].apply(
-            pd.to_numeric,
-            errors="coerce",
-        )
-
-        model.fit(X, y)
-
-        joblib.dump(
-            {
-                "model": model,
-                "features": numeric,
-            },
-            model_path,
-        )
-
-    values = (
-        features
-        or customer["payload"]
-    )
-
-    sample = pd.DataFrame(
-        [
-            {
-                c: values.get(c)
-                for c in numeric
-            }
-        ]
-    )
-
-    probability = float(
-        model.predict_proba(
-            sample[numeric].apply(
-                pd.to_numeric,
-                errors="coerce",
-            )
-        )[0][1]
-    )
-
-    confidence = round(
-        max(
-            probability,
-            1 - probability,
-        ),
-        3,
-    )
-
-    prediction = (
-        "high_churn_risk"
-        if probability >= 0.5
-        else "low_churn_risk"
-    )
-
-    pid = str(uuid.uuid4())
-
-    coefficients = (
-        model.named_steps[
-            "logisticregression"
-        ].coef_[0]
-    )
-
-    explanation = sorted(
-        [
-            {
-                "feature": name,
-                "contribution": round(
-                    float(coef),
-                    4,
-                ),
-            }
-            for name, coef in zip(
-                numeric,
-                coefficients,
-            )
-        ],
-        key=lambda item: abs(
-            item["contribution"]
-        ),
-        reverse=True,
-    )[:5]
-
-    with connection() as conn:
-
-        conn.execute(
-            """
-            INSERT INTO predictions(
-                id,
-                customer_id,
-                dataset_id,
-                prediction,
-                probability,
-                confidence,
-                explanation_json
-            )
-            VALUES(?,?,?,?,?,?,?)
-            """,
-            (
-                pid,
-                customer_id,
-                customer["dataset_id"],
-                prediction,
-                probability,
-                confidence,
-                json.dumps(explanation),
-            ),
-        )
-
-    return {
-        "id": pid,
-        "prediction": prediction,
-        "probability": probability,
-        "confidence": confidence,
-        "explanation": explanation,
-    }
-
-
-@router.post("/predict/batch")
-def predict_batch(
-    body: dict[str, Any],
-    user: dict = Depends(current_user),
-):
-
-    return [
-        predict(
-            {
-                "customer_id": str(
-                    item.get(
-                        "customer_id",
-                        "",
-                    )
-                ),
-                "features": item.get(
-                    "features",
-                    {},
-                ),
-            },
-            user,
-        )
-        for item in body.get(
-            "items",
-            [],
-        )
-    ]
-
-
-@router.get("/predictions/history")
-def prediction_history(
-    user: dict = Depends(current_user),
-):
-
-    with connection() as conn:
-
-        rows = conn.execute(
-            """
-            SELECT p.*
-            FROM predictions p
-            JOIN datasets d
-                ON p.dataset_id=d.id
-            WHERE d.owner_id=?
-            ORDER BY p.created_at DESC
-            LIMIT 100
-            """,
-            (user["sub"],),
-        ).fetchall()
-
-    return [
-        {
-            **dict(r),
-            "explanation": decode_json(
-                r["explanation_json"],
-                [],
-            ),
-        }
-        for r in rows
-    ]
-
-
-# ============================================================
 # DOCUMENT UPLOAD / RAG INDEXING
 # ============================================================
 
@@ -2607,7 +2755,6 @@ async def upload_document(
     file: UploadFile = File(...),
     user: dict = Depends(current_user),
 ):
-
     if (
         not file.filename
         or Path(file.filename).suffix.lower()
@@ -2620,33 +2767,31 @@ async def upload_document(
             ".json",
         }
     ):
-
         raise HTTPException(
             422,
-            "Supported document files: "
-            "PDF, DOCX, TXT, Markdown, JSON",
+            "Supported document files: PDF, DOCX, TXT, Markdown, JSON",
         )
 
     raw = await file.read()
 
     if not raw:
-
         raise HTTPException(
             422,
             "Uploaded file is empty",
         )
 
-    checksum = hashlib.sha256(
-        raw
-    ).hexdigest()
+    checksum = hashlib.sha256(raw).hexdigest()
+
+    # --------------------------------------------------------
+    # Check for duplicate document
+    # --------------------------------------------------------
 
     with connection() as conn:
-
         existing = conn.execute(
             """
-            SELECT id,filename,chunks_json
+            SELECT id, filename, chunks_json
             FROM documents
-            WHERE owner_id=? AND checksum=?
+            WHERE owner_id = ? AND checksum = ?
             """,
             (
                 user["sub"],
@@ -2655,7 +2800,6 @@ async def upload_document(
         ).fetchone()
 
     if existing:
-
         return {
             "document_id": existing["id"],
             "filename": existing["filename"],
@@ -2668,7 +2812,15 @@ async def upload_document(
             "status": "indexed",
         }
 
+    # --------------------------------------------------------
+    # Generate document ID
+    # --------------------------------------------------------
+
     did = str(uuid.uuid4())
+
+    # --------------------------------------------------------
+    # Save physical document
+    # --------------------------------------------------------
 
     base_dir = (
         Path(settings.upload_dir)
@@ -2687,14 +2839,14 @@ async def upload_document(
 
     path.write_bytes(raw)
 
-    try:
+    # --------------------------------------------------------
+    # Extract text
+    # --------------------------------------------------------
 
-        content = DocumentParser.extract_text(
-            path
-        )
+    try:
+        content = DocumentParser.extract_text(path)
 
     except Exception as exc:
-
         path.unlink(
             missing_ok=True
         )
@@ -2705,7 +2857,6 @@ async def upload_document(
         ) from exc
 
     if not content.strip():
-
         path.unlink(
             missing_ok=True
         )
@@ -2714,6 +2865,10 @@ async def upload_document(
             422,
             "No readable text was found in this document",
         )
+
+    # --------------------------------------------------------
+    # Chunk document
+    # --------------------------------------------------------
 
     chunks = DocumentChunker(
         chunk_size=900,
@@ -2732,31 +2887,27 @@ async def upload_document(
         document_embeddings().collection_name,
     )
 
-    try:
+    # --------------------------------------------------------
+    # Generate embeddings / RAG indexing
+    # --------------------------------------------------------
 
+    try:
         document_embeddings().embed_chunks(
             [
                 {
                     "text": chunk,
                     "document_id": did,
-                    "owner_id": str(
-                        user["sub"]
-                    ),
+                    "owner_id": str(user["sub"]),
                     "filename": file.filename,
-                    "chunk_id": (
-                        f"{did}:{index}"
-                    ),
+                    "chunk_id": f"{did}:{index}",
                     "upload_time": upload_time,
                     "checksum": checksum,
                 }
-                for index, chunk in enumerate(
-                    chunks
-                )
+                for index, chunk in enumerate(chunks)
             ]
         )
 
     except Exception as exc:
-
         path.unlink(
             missing_ok=True
         )
@@ -2765,6 +2916,10 @@ async def upload_document(
             503,
             f"Document indexing is unavailable: {exc}",
         ) from exc
+
+    # --------------------------------------------------------
+    # Save document metadata
+    # --------------------------------------------------------
 
     with connection() as conn:
 
@@ -2846,52 +3001,66 @@ async def upload_document(
     }
 
 
+# ============================================================
+# LIST DOCUMENTS
+# ============================================================
+
 @router.get("/documents")
 def list_documents(
     user: dict = Depends(current_user),
 ):
+    """Return documents whose original files still exist."""
 
     with connection() as conn:
-
         rows = conn.execute(
             """
             SELECT
-                id,
-                filename,
-                path,
-                file_type,
-                size_bytes,
-                checksum,
-                indexed_at,
-                created_at
+                id, filename, path, file_type, size_bytes,
+                checksum, indexed_at, created_at
             FROM documents
-            WHERE owner_id=?
+            WHERE owner_id = ?
             ORDER BY created_at DESC
             """,
             (user["sub"],),
         ).fetchall()
 
-    return [
-        {
-            "id": row["id"],
-            "filename": row["filename"],
-            "path": row["path"],
-            "file_type": row["file_type"],
-            "size_bytes": row["size_bytes"],
-            "checksum": row["checksum"],
-            "indexed_at": row["indexed_at"],
-            "created_at": row["created_at"],
-        }
-        for row in rows
-    ]
+    result = []
 
+    for row in rows:
+        file_path = _resolve_upload_path(
+            row["path"],
+            "documents",
+            row["id"],
+            row["file_type"] or "",
+        )
+
+        if file_path is None:
+            continue
+
+        result.append(
+            {
+                "id": row["id"],
+                "filename": row["filename"],
+                "path": str(file_path),
+                "file_type": row["file_type"],
+                "size_bytes": row["size_bytes"],
+                "checksum": row["checksum"],
+                "indexed_at": row["indexed_at"],
+                "created_at": row["created_at"],
+            }
+        )
+
+    return result
+
+# ============================================================
+# GET SINGLE DOCUMENT
+# ============================================================
 
 @router.get("/documents/{document_id}")
 def get_document(
     document_id: str,
     user: dict = Depends(current_user),
 ):
-
     with connection() as conn:
 
         row = conn.execute(
@@ -2907,7 +3076,7 @@ def get_document(
                 content,
                 created_at
             FROM documents
-            WHERE id=? AND owner_id=?
+            WHERE id = ? AND owner_id = ?
             """,
             (
                 document_id,
@@ -2916,7 +3085,6 @@ def get_document(
         ).fetchone()
 
     if not row:
-
         raise HTTPException(
             404,
             "Document not found",
@@ -2935,6 +3103,109 @@ def get_document(
     }
 
 
+# ============================================================
+# DATASET DOWNLOAD
+# ============================================================
+
+@router.get("/datasets/{dataset_id}/download")
+def download_dataset(
+    dataset_id: str,
+    user: dict = Depends(current_user),
+):
+    """Download a dataset as CSV."""
+
+    row, _ = load_dataset(
+        dataset_id,
+        user["sub"],
+    )
+
+    file_path = _resolve_upload_path(
+        row.get("path"),
+        "datasets",
+        dataset_id,
+        ".csv",
+    )
+
+    if file_path is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Dataset file no longer exists on the server.",
+        )
+
+    return FileResponse(
+        path=str(file_path),
+        filename=row["filename"],
+        media_type="text/csv",
+    )
+
+
+# ============================================================
+# DOCUMENT DOWNLOAD
+# ============================================================
+
+@router.get("/documents/{document_id}/download")
+def download_document(
+    document_id: str,
+    user: dict = Depends(current_user),
+):
+    """Download the original uploaded document."""
+
+    with connection() as conn:
+        row = conn.execute(
+            """
+            SELECT id, filename, path, file_type
+            FROM documents
+            WHERE id=? AND owner_id=?
+            """,
+            (document_id, user["sub"]),
+        ).fetchone()
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found.",
+        )
+
+    file_type = (row["file_type"] or "").lower()
+
+    file_path = _resolve_upload_path(
+        row["path"],
+        "documents",
+        document_id,
+        file_type,
+    )
+
+    if file_path is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Document file no longer exists on the server.",
+        )
+
+    media_types = {
+        ".pdf": "application/pdf",
+        ".txt": "text/plain",
+        ".md": "text/markdown",
+        ".markdown": "text/markdown",
+        ".json": "application/json",
+        ".docx": (
+            "application/vnd.openxmlformats-officedocument."
+            "wordprocessingml.document"
+        ),
+    }
+
+    return FileResponse(
+        path=str(file_path),
+        filename=row["filename"],
+        media_type=media_types.get(
+            file_type,
+            "application/octet-stream",
+        ),
+    )
+
+# ============================================================
+# DELETE DOCUMENT
+# ============================================================
+
 @router.delete(
     "/documents/{document_id}",
     status_code=204,
@@ -2943,14 +3214,13 @@ def delete_document(
     document_id: str,
     user: dict = Depends(current_user),
 ):
-
     with connection() as conn:
 
         row = conn.execute(
             """
             SELECT path
             FROM documents
-            WHERE id=? AND owner_id=?
+            WHERE id = ? AND owner_id = ?
             """,
             (
                 document_id,
@@ -2959,7 +3229,6 @@ def delete_document(
         ).fetchone()
 
         if not row:
-
             raise HTTPException(
                 404,
                 "Document not found",
@@ -2967,26 +3236,42 @@ def delete_document(
 
         conn.execute(
             """
-            DELETE FROM documents
-            WHERE id=? AND owner_id=?
+            DELETE FROM uploads
+            WHERE document_id = ? AND owner_id = ?
             """,
-            (
-                document_id,
-                user["sub"],
-            ),
+            (document_id, user["sub"]),
         )
 
-    if row["path"]:
-
-        Path(
-            row["path"]
-        ).unlink(
-            missing_ok=True
+        conn.execute(
+            """
+            DELETE FROM documents
+            WHERE id = ? AND owner_id = ?
+            """,
+            (document_id, user["sub"]),
         )
 
-    document_embeddings().delete_document(
-        document_id
+    file_path = _resolve_upload_path(
+        row["path"],
+        "documents",
+        document_id,
+        Path(row["path"]).suffix if row["path"] else "",
     )
+
+    if file_path is not None:
+        file_path.unlink(missing_ok=True)
+
+    # Remove document embeddings
+    try:
+        document_embeddings().delete_document(
+            document_id
+        )
+    except Exception as exc:
+        logger.warning(
+            "Document embeddings could not be deleted "
+            "for document_id={}: {}",
+            document_id,
+            exc,
+        )
 
 
 # ============================================================
@@ -3078,104 +3363,6 @@ DOCUMENT CONTEXT:
         )
 
 
-# ============================================================
-# RAG QUERY
-# ============================================================
-
-@router.post("/rag/query")
-@router.post("/rag/query")
-def rag_query(body: dict[str, str], user: dict = Depends(current_user)):
-    q = body.get("question", "").strip()
-
-    if not q:
-        raise HTTPException(422, "question is required")
-
-    # First try structured dataset analysis.
-    analytical = structured_answer(q, user["sub"])
-
-    # If this is a dataset question, return the Pandas result
-    # immediately. Do NOT send it to document RAG.
-    if analytical:
-        with connection() as conn:
-            conn.execute(
-                "INSERT INTO chat_history("
-                "id,user_id,question,answer,sources_json,confidence"
-                ") VALUES(?,?,?,?,?,?)",
-                (
-                    str(uuid.uuid4()),
-                    user["sub"],
-                    q,
-                    analytical["answer"],
-                    json.dumps(analytical["sources"]),
-                    analytical["confidence"],
-                ),
-            )
-
-        return analytical
-
-    # Otherwise, treat it as a document/RAG question.
-    matches = []
-
-    try:
-        matches = document_embeddings().similarity_search(
-            q,
-            top_k=5,
-            owner_id=user["sub"],
-        )
-    except Exception as exc:
-        raise HTTPException(
-            503,
-            f"Document retrieval is unavailable: {exc}",
-        ) from exc
-
-    if not matches:
-        logger.info(
-            "Copilot query found no document matches "
-            "question={} collection={}",
-            q,
-            document_embeddings().collection_name,
-        )
-
-        return {
-            "answer": (
-                "No information exists in the uploaded "
-                "documents relevant to this question."
-            ),
-            "confidence": 0.0,
-            "sources": [],
-            "citations": [],
-            "chunks": [],
-            "filename": None,
-            "retrieved_chunks": 0,
-            "similarity_score": 0.0,
-        }
-
-    context = build_rag_context(matches)
-
-    answer = context[:4000]
-
-    if settings.groq_api_key:
-        try:
-            answer = GroqService(
-                api_key=settings.groq_api_key,
-                model=settings.groq_model,
-            ).generate_answer(q, context)
-
-        except Exception as exc:
-            logger.warning(
-                "Groq generation failed for RAG query: {}",
-                exc,
-            )
-
-            answer = (
-                "I couldn't find enough information in the "
-                "uploaded documents to answer this question."
-            )
-
-    confidence = round(
-        sum(m["score"] for m in matches) / len(matches),
-        2,
-    )
 
     safe_matches = [
         document_embeddings().normalize_match(m)
@@ -3683,18 +3870,6 @@ def search(
 # ============================================================
 # DASHBOARD REPORT
 # ============================================================
-
-@router.get("/reports/dashboard")
-def report_dashboard(
-    format: str = "json",
-    user: dict = Depends(current_user),
-):
-
-    data = dashboard(user)
-
-    if format == "json":
-
-        return data
 
     if format == "csv":
 

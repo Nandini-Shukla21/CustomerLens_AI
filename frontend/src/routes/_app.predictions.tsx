@@ -1,2 +1,61 @@
-import { createFileRoute } from "@tanstack/react-router"; import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"; import { useState } from "react"; import { Card } from "@/components/ui/card"; import { Button } from "@/components/ui/button"; import { PageHeader } from "@/components/ui/PageHeader"; import { platformApi } from "@/api/platform";
-export const Route=createFileRoute("/_app/predictions")({component:PredictionsPage}); function PredictionsPage(){const customers=useQuery({queryKey:["customers"],queryFn:()=>platformApi.customers()});const history=useQuery({queryKey:["prediction-history"],queryFn:platformApi.predictionHistory});const [id,setId]=useState("");const qc=useQueryClient();const predict=useMutation({mutationFn:()=>platformApi.predict(id),onSuccess:()=>qc.invalidateQueries({queryKey:["prediction-history"]})}); return <div className="space-y-6"><PageHeader eyebrow="Predictions" title="Run prediction" description="Predictions run against customers in your uploaded datasets."/><Card className="p-6"><select className="w-full rounded border p-2" value={id} onChange={e=>setId(e.target.value)}><option value="">Select uploaded customer</option>{(customers.data??[]).map((c:{id:string;name:string})=><option key={c.id} value={c.id}>{c.name} ({c.id})</option>)}</select><Button className="mt-3" disabled={!id||predict.isPending} onClick={()=>predict.mutate()}>Run churn prediction</Button>{predict.data&&<p className="mt-3">{predict.data.prediction}: {(predict.data.probability*100).toFixed(1)}% probability, {(predict.data.confidence*100).toFixed(1)}% confidence.</p>}</Card><Card className="p-6"><h3 className="font-semibold">Prediction history</h3><ul className="mt-3 space-y-2">{(history.data??[]).map((p:{id:string;customer_id:string;prediction:string;probability:number;created_at:string})=><li key={p.id} className="border-b pb-2">{p.customer_id}: <b>{p.prediction}</b> ({(p.probability*100).toFixed(1)}%) <span className="text-xs text-muted-foreground">{p.created_at}</span></li>)}</ul></Card></div>}
+import { createFileRoute } from "@tanstack/react-router";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
+import { Card } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { PageHeader } from "@/components/ui/PageHeader";
+import { platformApi } from "@/api/platform";
+
+export const Route = createFileRoute("/_app/predictions")({ component: PredictionsPage });
+
+function PredictionsPage() {
+	const customers = useQuery({ queryKey: ["customers"], queryFn: () => platformApi.customers() });
+	const history = useQuery({ queryKey: ["prediction-history"], queryFn: platformApi.predictionHistory });
+	const [id, setId] = useState("");
+	const qc = useQueryClient();
+
+	const predict = useMutation({
+		mutationFn: () => platformApi.predict(id),
+		onSuccess: () => qc.invalidateQueries({ queryKey: ["prediction-history"] }),
+	});
+
+	return (
+		<div className="space-y-6">
+			<PageHeader eyebrow="Predictions" title="Run prediction" description="Predictions run against customers in your uploaded datasets." />
+
+			<Card className="p-6">
+				<select className="w-full rounded border p-2" value={id} onChange={(e) => setId(e.target.value)}>
+					<option value="">Select uploaded customer</option>
+					{(customers.data ?? []).map((c: { id: string; name: string }) => (
+						<option key={c.id} value={c.id}>
+							{c.name} ({c.id})
+						</option>
+					))}
+				</select>
+
+				<Button className="mt-3" disabled={!id || predict.isPending} onClick={() => predict.mutate()}>
+					Run churn prediction
+				</Button>
+
+				{predict.data && (
+					predict.data.available === false ? (
+						<p className="mt-3 text-sm text-muted-foreground">Unavailable: {predict.data.reason}</p>
+					) : (
+						<p className="mt-3">{predict.data.prediction}: {(predict.data.probability * 100).toFixed(1)}% probability, {(predict.data.confidence * 100).toFixed(1)}% confidence.</p>
+					)
+				)}
+			</Card>
+
+			<Card className="p-6">
+				<h3 className="font-semibold">Prediction history</h3>
+				<ul className="mt-3 space-y-2">
+					{(history.data ?? []).map((p: { id: string; customer_id: string; prediction: string; probability: number; created_at: string }) => (
+						<li key={p.id} className="border-b pb-2">
+							{p.customer_id}: <b>{p.prediction}</b> ({(p.probability * 100).toFixed(1)}%) <span className="text-xs text-muted-foreground">{p.created_at}</span>
+						</li>
+					))}
+				</ul>
+			</Card>
+		</div>
+	);
+}

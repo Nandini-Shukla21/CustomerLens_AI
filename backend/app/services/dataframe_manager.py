@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from threading import RLock
 from typing import Any
 
@@ -18,6 +18,7 @@ class DatasetRecord:
     column_count: int
     columns: list[str]
     created_at: str
+    file_path: str | None = None
 
 
 class DataFrameManager:
@@ -36,6 +37,7 @@ class DataFrameManager:
     def __init__(self) -> None:
         if getattr(self, "_initialized", False):
             return
+
         self._datasets: dict[str, DatasetRecord] = {}
         self._initialized = True
 
@@ -45,8 +47,10 @@ class DataFrameManager:
         dataframe: pd.DataFrame,
         *,
         filename: str,
+        file_path: str | None = None,
     ) -> DatasetRecord:
         """Store a dataframe in memory and return its metadata record."""
+
         record = DatasetRecord(
             dataset_id=dataset_id,
             dataframe=dataframe,
@@ -55,23 +59,46 @@ class DataFrameManager:
             column_count=int(dataframe.shape[1]),
             columns=[str(column) for column in dataframe.columns.tolist()],
             created_at="now",
+            file_path=file_path,
         )
+
         self._datasets[dataset_id] = record
+
         return record
 
     def get_dataframe(self, dataset_id: str) -> pd.DataFrame:
         """Return a dataframe by dataset id."""
+
         record = self._datasets.get(dataset_id)
+
         if record is None:
             raise KeyError(f"Dataset {dataset_id} was not found")
+
         return record.dataframe
 
-    def delete_dataframe(self, dataset_id: str) -> None:
-        """Delete a dataframe from the in-memory store."""
-        self._datasets.pop(dataset_id, None)
+    def get_dataset_metadata(self, dataset_id: str) -> DatasetRecord:
+        """Return metadata for a managed dataset."""
+
+        record = self._datasets.get(dataset_id)
+
+        if record is None:
+            raise KeyError(f"Dataset {dataset_id} was not found")
+
+        return record
+
+    def delete_dataframe(self, dataset_id: str) -> DatasetRecord:
+        """Remove a dataset from the in-memory store."""
+
+        record = self._datasets.pop(dataset_id, None)
+
+        if record is None:
+            raise KeyError(f"Dataset {dataset_id} was not found")
+
+        return record
 
     def list_datasets(self) -> list[dict[str, Any]]:
         """List dataset metadata in a dashboard-friendly structure."""
+
         return [
             {
                 "dataset_id": record.dataset_id,
@@ -80,13 +107,7 @@ class DataFrameManager:
                 "column_count": record.column_count,
                 "columns": record.columns,
                 "created_at": record.created_at,
+                "file_path": record.file_path,
             }
             for record in self._datasets.values()
         ]
-
-    def get_dataset_metadata(self, dataset_id: str) -> DatasetRecord:
-        """Return metadata for a managed dataset."""
-        record = self._datasets.get(dataset_id)
-        if record is None:
-            raise KeyError(f"Dataset {dataset_id} was not found")
-        return record

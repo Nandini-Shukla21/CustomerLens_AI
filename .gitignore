@@ -133,3 +133,9 @@ dist/
 
 *.swp
 *.swo
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local uploaded datasets
+backend/uploads/
