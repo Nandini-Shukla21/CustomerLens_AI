@@ -329,13 +329,13 @@ function AnalyticsPage() {
               .toLowerCase()
               .includes("wlb");
 
-          const scatterColor =
-            isExperienceScatter
-              ? scatterColors.experience
-              : isWlbScatter
-                ? scatterColors.wlb
-                : colors[idx % colors.length];
+          let scatterColor = colors[idx % colors.length];
 
+          if (isExperienceScatter) {
+  scatterColor = scatterColors.experience;
+} else if (isWlbScatter) {
+  scatterColor = scatterColors.wlb;
+}
           return (
             <Chart
               key={idx}
