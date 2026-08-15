@@ -325,107 +325,348 @@ def generate_charts(df: pd.DataFrame, detected: dict[str, Optional[str]]) -> Lis
     return charts
 
 
-def generate_insights(df: pd.DataFrame, detected: dict[str, Optional[str]], source: Optional[str] = None) -> List[dict[str, Any]]:
-    insights: List[dict[str, Any]] = []
-    # Use metrics to derive simple, factual insights
-    metrics = compute_metrics(df, detected)
+def generate_insights(
+    df: pd.DataFrame,
+    detected: dict[str, Optional[str]],
+    source: Optional[str] = None,
+) -> List[dict[str, Any]]:
+    """
+    Generate factual insights from any structured dataset.
 
-    # top category
-    category = detected.get("category")
-    if category:
-        top = df[category].fillna("Unknown").astype(str).value_counts().head(1)
-        if not top.empty:
-            name = top.index[0]
-            count = int(top.iloc[0])
+    The function supports:
+    - categorical distributions
+    - numeric statistics
+    - correlations
+    - missing values
+    - business-specific signals such as revenue/churn/fraud
+    - employee/survey-style datasets
+    """
+
+    insights: List[dict[str, Any]] = []
+
+    if df.empty:
+        return insights
+
+    metrics = compute_metrics(df, detected)
+    classification = classify_columns(df)
+
+    numeric_columns = [
+        c for c in classification["numeric"]
+        if c not in classification["identifier"]
+    ]
+
+    categorical_columns = [
+        c for c in classification["categorical"]
+        if c not in classification["identifier"]
+    ]
+
+    # ---------------------------------------------------------
+    # 1. DATASET SIZE
+    # ---------------------------------------------------------
+
+    insights.append({
+        "title": "Dataset overview",
+        "description": (
+            f"The dataset contains {len(df):,} records "
+            f"across {len(df.columns)} columns."
+        ),
+        "metric": "dataset_size",
+        "value": len(df),
+        "source": source,
+        "priority": "Info",
+        "confidence": 1.0,
+    })
+
+    # ---------------------------------------------------------
+    # 2. MISSING VALUES
+    # ---------------------------------------------------------
+
+    missing_total = int(df.isna().sum().sum())
+
+    if missing_total > 0:
+        missing_by_column = df.isna().sum()
+        missing_by_column = missing_by_column[
+            missing_by_column > 0
+        ].sort_values(ascending=False)
+
+        top_missing = missing_by_column.index[0]
+        top_missing_count = int(missing_by_column.iloc[0])
+
+        insights.append({
+            "title": "Missing data detected",
+            "description": (
+                f"{missing_total:,} missing values were found. "
+                f"The column '{top_missing}' has the most missing values "
+                f"({top_missing_count:,})."
+            ),
+            "metric": "missing_values",
+            "value": missing_total,
+            "source": source,
+            "priority": "Medium",
+            "confidence": 1.0,
+        })
+    else:
+        insights.append({
+            "title": "Complete dataset",
+            "description": "No missing values were detected in the uploaded dataset.",
+            "metric": "missing_values",
+            "value": 0,
+            "source": source,
+            "priority": "Low",
+            "confidence": 1.0,
+        })
+
+    # ---------------------------------------------------------
+    # 3. CATEGORICAL INSIGHTS
+    # ---------------------------------------------------------
+
+    for col in categorical_columns[:3]:
+
+        series = df[col].dropna().astype(str)
+
+        if series.empty:
+            continue
+
+        counts = series.value_counts()
+
+        if counts.empty:
+            continue
+
+        top_value = str(counts.index[0])
+        top_count = int(counts.iloc[0])
+
+        percentage = (top_count / len(series)) * 100
+
+        insights.append({
+            "title": f"Dominant {col}",
+            "description": (
+                f"'{top_value}' is the most common value in {col}, "
+                f"representing {percentage:.1f}% of records "
+                f"({top_count:,} records)."
+            ),
+            "metric": "category_dominance",
+            "value": top_count,
+            "source": source,
+            "priority": "High" if percentage >= 50 else "Medium",
+            "confidence": min(1.0, percentage / 100 + 0.5),
+        })
+
+        # Diversity insight
+        unique_count = int(series.nunique())
+
+        insights.append({
+            "title": f"{col} diversity",
+            "description": (
+                f"The {col} column contains {unique_count} distinct categories."
+            ),
+            "metric": "category_count",
+            "value": unique_count,
+            "source": source,
+            "priority": "Info",
+            "confidence": 1.0,
+        })
+
+    # ---------------------------------------------------------
+    # 4. NUMERIC COLUMN INSIGHTS
+    # ---------------------------------------------------------
+
+    for col in numeric_columns[:4]:
+
+        values = pd.to_numeric(
+            df[col],
+            errors="coerce"
+        ).dropna()
+
+        if values.empty:
+            continue
+
+        mean_value = float(values.mean())
+        min_value = float(values.min())
+        max_value = float(values.max())
+        median_value = float(values.median())
+
+        # Average
+        insights.append({
+            "title": f"Average {col}",
+            "description": (
+                f"The average {col} is {mean_value:.2f}, "
+                f"with values ranging from {min_value:.2f} "
+                f"to {max_value:.2f}."
+            ),
+            "metric": f"average_{_normalize(col)}",
+            "value": mean_value,
+            "source": source,
+            "priority": "Info",
+            "confidence": 1.0,
+        })
+
+        # Median
+        insights.append({
+            "title": f"Median {col}",
+            "description": (
+                f"The median {col} is {median_value:.2f}."
+            ),
+            "metric": f"median_{_normalize(col)}",
+            "value": median_value,
+            "source": source,
+            "priority": "Info",
+            "confidence": 1.0,
+        })
+
+    # ---------------------------------------------------------
+    # 5. RANGE / EXTREME VALUE INSIGHTS
+    # ---------------------------------------------------------
+
+    if numeric_columns:
+
+        for col in numeric_columns[:2]:
+
+            values = pd.to_numeric(
+                df[col],
+                errors="coerce"
+            ).dropna()
+
+            if values.empty:
+                continue
+
+            max_value = float(values.max())
+            min_value = float(values.min())
+
             insights.append({
-                "title": f"Dominant {category}: {name}",
-                "description": f"{count} records belong to {name} in column {category}.",
-                "metric": "category_dominance",
-                "value": count,
+                "title": f"Highest {col}",
+                "description": (
+                    f"The highest recorded {col} is {max_value:.2f}."
+                ),
+                "metric": f"max_{_normalize(col)}",
+                "value": max_value,
                 "source": source,
+                "priority": "Medium",
+                "confidence": 1.0,
             })
 
-    # money-driven insights
+    # ---------------------------------------------------------
+    # 6. CORRELATION INSIGHTS
+    # ---------------------------------------------------------
+
+    if len(numeric_columns) >= 2:
+
+        numeric_df = df[numeric_columns].apply(
+            pd.to_numeric,
+            errors="coerce"
+        )
+
+        correlation = numeric_df.corr()
+
+        best_pair = None
+        best_corr = 0.0
+
+        for i in range(len(correlation.columns)):
+            for j in range(i + 1, len(correlation.columns)):
+
+                a = correlation.columns[i]
+                b = correlation.columns[j]
+
+                value = correlation.iloc[i, j]
+
+                if pd.isna(value):
+                    continue
+
+                if abs(float(value)) > abs(best_corr):
+                    best_corr = float(value)
+                    best_pair = (a, b)
+
+        if best_pair and abs(best_corr) >= 0.3:
+
+            a, b = best_pair
+
+            strength = (
+                "strong"
+                if abs(best_corr) >= 0.7
+                else "moderate"
+                if abs(best_corr) >= 0.5
+                else "weak"
+            )
+
+            direction = (
+                "positive"
+                if best_corr > 0
+                else "negative"
+            )
+
+            insights.append({
+                "title": f"{a} vs {b}",
+                "description": (
+                    f"There is a {strength} {direction} relationship "
+                    f"between {a} and {b} "
+                    f"(correlation: {best_corr:.2f})."
+                ),
+                "metric": "correlation",
+                "value": best_corr,
+                "source": source,
+                "priority": "High" if abs(best_corr) >= 0.7 else "Medium",
+                "confidence": abs(best_corr),
+            })
+
+    # ---------------------------------------------------------
+    # 7. BUSINESS-SPECIFIC INSIGHTS
+    # ---------------------------------------------------------
+
     money = detected.get("money")
-    date = detected.get("date")
+
     if money:
-        ser = pd.to_numeric(df[money], errors="coerce").dropna()
-        if not ser.empty:
-            top_idx = ser.idxmax()
-            top_val = float(ser.max())
+
+        values = pd.to_numeric(
+            df[money],
+            errors="coerce"
+        ).dropna()
+
+        if not values.empty:
+
             insights.append({
                 "title": f"Highest {money}",
-                "description": f"Maximum {money} value is {top_val}.",
+                "description": (
+                    f"Maximum {money} value is {values.max():,.2f}."
+                ),
                 "metric": "max_money",
-                "value": top_val,
+                "value": float(values.max()),
                 "source": source,
+                "priority": "High",
+                "confidence": 1.0,
             })
-            if date:
-                tmp = pd.DataFrame({"date": pd.to_datetime(df[date], errors="coerce"), "value": ser}).dropna()
-                if not tmp.empty:
-                    recent = tmp.sort_values("date", ascending=False).head(1)
-                    if not recent.empty:
-                        insights.append({"title": f"Most recent {money} record", "description": f"Most recent {money} at {recent.iloc[0]["date"]}: {recent.iloc[0]["value"]}", "metric": "recent_money", "value": float(recent.iloc[0]["value"]), "source": source})
 
-    # churn concentration
     churn = detected.get("churn")
+
     if churn:
-        ser = pd.to_numeric(df[churn], errors="coerce").fillna(0)
-        if ser.sum() > 0:
-            pct = float((ser >= 0.5).sum()) / max(1, int(len(df)))
-            insights.append({"title": "Churn concentration", "description": f"{pct*100:.1f}% of records indicate churn (>=0.5).", "metric": "churn_rate", "value": pct, "source": source})
 
-    # Air quality / sensor-driven insights
-    # Detect common pollutant columns by name
-    pollutant_aliases = {
-        "aqi": ["aqi", "air_quality", "airquality"],
-        "pm25": ["pm25", "pm_25", "pm_2_5"],
-        "pm10": ["pm10", "pm_10"],
-        "no2": ["no2"],
-        "so2": ["so2"],
-        "o3": ["o3"],
-        "co": ["co"],
-        "temperature": ["temperature", "temp"],
-        "humidity": ["humidity"],
-    }
+        values = pd.to_numeric(
+            df[churn],
+            errors="coerce"
+        ).dropna()
 
-    # helper to find column by aliases
-    def _find_alias(aliases: list[str]) -> Optional[str]:
-        for a in aliases:
-            for col in df.columns:
-                if _normalize(col) == _normalize(a) or _normalize(a) in _normalize(col):
-                    return str(col)
-        return None
+        if not values.empty:
 
-    location_col = detected.get("location")
+            churn_rate = float(
+                (values >= 0.5).mean()
+            )
 
-    for key, aliases in pollutant_aliases.items():
-        col = _find_alias(aliases)
-        if col and pd.api.types.is_numeric_dtype(df[col]):
-            vals = pd.to_numeric(df[col], errors="coerce").dropna()
-            if vals.empty:
-                continue
             insights.append({
-                "title": f"Average {key}",
-                "description": f"Average {key} is {vals.mean():.2f}.",
-                "metric": f"avg_{key}",
-                "value": float(vals.mean()),
+                "title": "Churn concentration",
+                "description": (
+                    f"{churn_rate * 100:.1f}% of records "
+                    f"indicate churn."
+                ),
+                "metric": "churn_rate",
+                "value": churn_rate,
                 "source": source,
+                "priority": "High",
+                "confidence": 1.0,
             })
 
-            # highest location if location column exists
-            if location_col:
-                idx = vals.idxmax()
-                loc = str(df.loc[idx, location_col]) if pd.notna(df.loc[idx, location_col]) else str(idx)
-                insights.append({
-                    "title": f"Highest {key} location",
-                    "description": f"Highest {key} observed at {loc} with value {vals.max():.2f}.",
-                    "metric": f"max_{key}_location",
-                    "value": float(vals.max()),
-                    "source": source,
-                })
+    # ---------------------------------------------------------
+    # 8. LIMIT RESULTS
+    # ---------------------------------------------------------
 
-    return insights
+    return insights[:12]
 
 
 def analyze_dataset(dataset_id: str, owner_id: str) -> dict[str, Any]:

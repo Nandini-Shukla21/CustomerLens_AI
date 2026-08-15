@@ -33,6 +33,42 @@ from fastapi import (
 )
 router = APIRouter()
 
+# ============================================================
+# ACTIVITY HELPER
+# ============================================================
+
+def log_activity(
+    owner_id: int,
+    action: str,
+    entity_type: str,
+    entity_name: str,
+    entity_id: str | None = None,
+    metadata: dict | None = None,
+) -> None:
+    with connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO activity_log(
+                id,
+                owner_id,
+                action,
+                entity_type,
+                entity_id,
+                entity_name,
+                metadata_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(uuid.uuid4()),
+                owner_id,
+                action,
+                entity_type,
+                entity_id,
+                entity_name,
+                json.dumps(metadata or {}),
+            ),
+        )
 
 # ============================================================
 # RAG / EMBEDDING SERVICE
@@ -145,31 +181,56 @@ def _resolve_upload_path(
     file_id: str,
     suffix: str = ".csv",
 ) -> Path | None:
-    """Resolve an uploaded file from its stored or expected path."""
+    """Resolve an uploaded file using the stored path or known upload locations."""
 
     candidates: list[Path] = []
 
+    # 1. Stored path from database
     if stored_path:
-        candidates.append(Path(stored_path))
+        stored = Path(stored_path)
 
+        if stored.is_absolute():
+            candidates.append(stored)
+        else:
+            # Relative to current working directory
+            candidates.append(Path.cwd() / stored)
+
+            # Relative to backend directory
+            backend_root = Path(__file__).resolve().parents[2]
+            candidates.append(backend_root / stored)
+
+    # 2. Current configured upload directory
     upload_root = Path(settings.upload_dir)
+
+    if not upload_root.is_absolute():
+        upload_root = Path.cwd() / upload_root
+
     candidates.append(
-        upload_root / category / f"{file_id}{suffix}"
+        upload_root
+        / category
+        / f"{file_id}{suffix}"
     )
 
-    project_root = Path(__file__).resolve().parents[2]
+    # 3. Backend-relative upload directory
+    backend_root = Path(__file__).resolve().parents[2]
+
     candidates.append(
-        project_root / upload_root / category / f"{file_id}{suffix}"
+        backend_root
+        / "uploads"
+        / category
+        / f"{file_id}{suffix}"
     )
 
+    # Return the first existing file
     for candidate in candidates:
         try:
             resolved = candidate.expanduser().resolve()
-        except OSError:
-            resolved = candidate.expanduser()
 
-        if resolved.is_file():
-            return resolved
+            if resolved.is_file():
+                return resolved
+
+        except OSError:
+            continue
 
     return None
 
@@ -1938,6 +1999,13 @@ def delete_dataset(
         dataset_id,
         user["sub"],
     )
+    log_activity(
+    owner_id=user["sub"],
+    action="delete",
+    entity_type="dataset",
+    entity_id=dataset_id,
+    entity_name=row["filename"],
+    )
 
     file_path = _resolve_upload_path(
         row.get("path"),
@@ -1969,6 +2037,124 @@ def delete_dataset(
 
     if file_path is not None:
         file_path.unlink(missing_ok=True)
+
+# ============================================================
+# HOME PAGE
+# ===========================================================
+
+@router.get("/home")
+def home(user: dict = Depends(current_user)):
+    owner_id = user["sub"]
+
+    with connection() as conn:
+
+        datasets = conn.execute(
+            """
+            SELECT
+                id,
+                filename,
+                rows,
+                columns,
+                created_at
+            FROM datasets
+            WHERE owner_id=?
+            ORDER BY created_at DESC
+            """,
+            (owner_id,),
+        ).fetchall()
+
+        documents = conn.execute(
+            """
+            SELECT
+                id,
+                filename,
+                file_type,
+                size_bytes,
+                created_at,
+                indexed_at
+            FROM documents
+            WHERE owner_id=?
+            ORDER BY created_at DESC
+            """,
+            (owner_id,),
+        ).fetchall()
+
+        customer_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM customers c
+            JOIN datasets d
+                ON c.dataset_id = d.id
+            WHERE d.owner_id=?
+            """,
+            (owner_id,),
+        ).fetchone()[0]
+
+        row_count = conn.execute(
+            """
+            SELECT COALESCE(SUM(rows), 0)
+            FROM datasets
+            WHERE owner_id=?
+            """,
+            (owner_id,),
+        ).fetchone()[0]
+
+        activity = conn.execute(
+            """
+            SELECT
+                action,
+                entity_type,
+                entity_name,
+                created_at
+            FROM activity_log
+            WHERE owner_id=?
+            ORDER BY created_at DESC
+            LIMIT 20
+            """,
+            (owner_id,),
+        ).fetchall()
+
+    return {
+        "metrics": {
+            "datasets": len(datasets),
+            "documents": len(documents),
+            "customers": int(customer_count or 0),
+            "rows": int(row_count or 0),
+        },
+
+        "datasets": [
+            {
+                "id": row["id"],
+                "filename": row["filename"],
+                "rows": int(row["rows"]),
+                "columns": int(row["columns"]),
+                "created_at": row["created_at"],
+            }
+            for row in datasets
+        ],
+
+        "documents": [
+            {
+                "id": row["id"],
+                "filename": row["filename"],
+                "file_type": row["file_type"],
+                "size_bytes": row["size_bytes"],
+                "created_at": row["created_at"],
+                "indexed_at": row["indexed_at"],
+            }
+            for row in documents
+        ],
+
+        "activity": [
+            {
+                "who": "You",
+                "what": f"{row['action']} {row['entity_name']}",
+                "when": row["created_at"],
+                "type": row["action"],
+            }
+            for row in activity
+        ],
+    }
 
 # ============================================================
 # DASHBOARD
@@ -2823,9 +3009,9 @@ async def upload_document(
     # --------------------------------------------------------
 
     base_dir = (
-        Path(settings.upload_dir)
-        / "documents"
-    )
+      Path(settings.upload_dir)
+      / "documents"
+    ).resolve()
 
     base_dir.mkdir(
         parents=True,
@@ -3009,14 +3195,20 @@ async def upload_document(
 def list_documents(
     user: dict = Depends(current_user),
 ):
-    """Return documents whose original files still exist."""
+    """Return all documents belonging to the current user."""
 
     with connection() as conn:
         rows = conn.execute(
             """
             SELECT
-                id, filename, path, file_type, size_bytes,
-                checksum, indexed_at, created_at
+                id,
+                filename,
+                path,
+                file_type,
+                size_bytes,
+                checksum,
+                indexed_at,
+                created_at
             FROM documents
             WHERE owner_id = ?
             ORDER BY created_at DESC
@@ -3034,14 +3226,11 @@ def list_documents(
             row["file_type"] or "",
         )
 
-        if file_path is None:
-            continue
-
         result.append(
             {
                 "id": row["id"],
                 "filename": row["filename"],
-                "path": str(file_path),
+                "path": str(file_path or row["path"]),
                 "file_type": row["file_type"],
                 "size_bytes": row["size_bytes"],
                 "checksum": row["checksum"],
@@ -3051,7 +3240,6 @@ def list_documents(
         )
 
     return result
-
 # ============================================================
 # GET SINGLE DOCUMENT
 # ============================================================
@@ -3218,7 +3406,7 @@ def delete_document(
 
         row = conn.execute(
             """
-            SELECT path
+            SELECT filename, path
             FROM documents
             WHERE id = ? AND owner_id = ?
             """,
@@ -3228,6 +3416,14 @@ def delete_document(
             ),
         ).fetchone()
 
+        log_activity(
+    owner_id=user["sub"],
+    action="delete",
+    entity_type="document",
+    entity_id=document_id,
+    entity_name=row["filename"],
+)
+        
         if not row:
             raise HTTPException(
                 404,
